@@ -1,8 +1,64 @@
 #include "scraper.h"
-#include "arena.h"
 
 #pragma comment(lib, "Shlwapi.lib")
 #include <shlwapi.h>
+
+typedef struct _ARENA_CONTEXT {
+	PCHAR Base;
+	SIZE_T Offset;
+	SIZE_T Size;
+} ARENA_CONTEXT, *PARENA_CONTEXT;
+
+__declspec(thread) ARENA_CONTEXT ArenaContext = { 0 };
+
+#define PAGE_SIZE 4096
+
+VOID ArenaDestroy()
+{
+	if (ArenaContext.Base)
+		VirtualFree(ArenaContext.Base, 0, MEM_RELEASE);
+
+	RtlZeroMemory(&ArenaContext, sizeof(ArenaContext));
+}
+
+PVOID
+ArenaAlloc(SIZE_T Size)
+{
+	SIZE_T Remaining = ArenaContext.Size - ArenaContext.Offset;
+	SIZE_T AlignedSize;
+	PVOID Block;
+
+	if (Size > Remaining)
+		return NULL;
+
+	AlignedSize = (Size + 7) & ~7;
+	Block = &ArenaContext.Base[ArenaContext.Offset];
+	ArenaContext.Offset += AlignedSize;
+
+	RtlZeroMemory(Block, Size);
+	return Block;
+}
+
+UINT32
+ArenaInit(SIZE_T Size)
+{
+	PVOID Base;
+
+	if (ArenaContext.Base)
+		return ERROR_ALREADY_INITIALIZED;
+
+	Size = (Size + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
+
+	Base = VirtualAlloc(NULL, Size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+	if (!Base)
+		return ERROR_NOT_ENOUGH_MEMORY;
+
+	ArenaContext.Base = Base;
+	ArenaContext.Offset = 0;
+	ArenaContext.Size = Size;
+
+	return ERROR_SUCCESS;
+}
 
 typedef struct _SESSION_CONTEXT {
 	HINTERNET SessionHandle;
@@ -68,6 +124,8 @@ UrlParse(_In_ LPCSTR Url, _Out_ LPURL_COMPONENTSA Components)
 	Components->lpszUrlPath = NULL;
 	Components->dwSchemeLength = 1;
 	Components->lpszScheme = NULL;
+	Components->dwExtraInfoLength = 1;
+	Components->lpszExtraInfo = NULL;
 
 	Ret = InternetCrackUrlA(Url, (DWORD)strlen(Url), 0, Components);
 	if (!Ret) {
@@ -96,6 +154,14 @@ UrlParse(_In_ LPCSTR Url, _Out_ LPURL_COMPONENTSA Components)
 	}
 
 	Components->dwSchemeLength++;
+	Components->lpszExtraInfo = ArenaAlloc(Components->dwExtraInfoLength + 1);
+	if (!Components->lpszExtraInfo) {
+		printf("Failed to allocate URL Extra Info buffer: %d\n",
+			   GetLastError());
+		return ERROR_NOT_ENOUGH_MEMORY;
+	}
+
+	Components->dwExtraInfoLength++;
 
 	Ret = InternetCrackUrlA(Url, (DWORD)strlen(Url), 0, Components);
 	if (!Ret) {
@@ -169,6 +235,19 @@ UrlBuildAbsoluteFromRelative(_In_ PSESSION_CONTEXT Ctx, _In_ LPCSTR Relative,
 	return Absolute;
 }
 
+/*
+ * Rather then reformatting the string, find the fragment '#' and
+ * replace it with the NUL terminator.
+ */
+STATIC
+VOID UrlStripFragment(_In_ PCHAR Url)
+{
+	PCHAR Fragment = StrChrA(Url, '#');
+
+	if (Fragment)
+		*Fragment = '\0';
+}
+
 typedef struct _PAGE {
 	URL_COMPONENTSA Components;
 	PCHAR AbsoluteUrl;
@@ -202,6 +281,8 @@ PageChildrenParseEntry(_In_ PSESSION_CONTEXT Ctx, _In_ PVOID Base,
 			return NULL;
 		}
 	}
+
+	UrlStripFragment(Url);
 
 	Ret = UrlParse(Url, &Page->Components);
 	if (Ret != ERROR_SUCCESS) {
@@ -289,6 +370,7 @@ UINT32 PageChildrenParse(_In_ PSESSION_CONTEXT Ctx, _In_ HINTERNET Request,
 	return ERROR_SUCCESS;
 }
 
+/* https://quotes.toscrape.com/ */
 UINT32
 Scrape(_In_ LPCSTR Url)
 {

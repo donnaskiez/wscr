@@ -21,9 +21,6 @@
     <ClCompile Include="scraper.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="arena.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <None Include="README.md" />
@@ -31,9 +28,6 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="scraper.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="arena.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

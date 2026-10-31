@@ -131,7 +131,6 @@
   <ItemGroup>
     <ClCompile Include="main.c" />
     <ClCompile Include="scraper.c" />
-    <ClCompile Include="arena.c" />
   </ItemGroup>
   <ItemGroup>
     <None Include=".clang-format" />
@@ -141,7 +140,6 @@
     </None>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="arena.h" />
     <ClInclude Include="scraper.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
