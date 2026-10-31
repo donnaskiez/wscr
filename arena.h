@@ -4,6 +4,11 @@
 #include <Windows.h>
 
 UINT32
-ArenaInit();
+ArenaInit(SIZE_T Size);
+
+PVOID
+ArenaAlloc(SIZE_T Size);
+
+VOID ArenaDestroy();
 
 #endif

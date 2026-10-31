@@ -1,4 +1,5 @@
 #include "scraper.h"
+#include "arena.h"
 
 #pragma comment(lib, "Shlwapi.lib")
 #include <shlwapi.h>
@@ -74,24 +75,21 @@ UrlParse(_In_ LPCSTR Url, _Out_ LPURL_COMPONENTSA Components)
 		return ERROR_BAD_ARGUMENTS;
 	}
 
-	Components->lpszHostName = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
-										 Components->dwHostNameLength + 1);
+	Components->lpszHostName = ArenaAlloc(Components->dwHostNameLength + 1);
 	if (!Components->lpszHostName) {
 		printf("Failed to allocate HostName buffer: %d\n", GetLastError());
 		return ERROR_NOT_ENOUGH_MEMORY;
 	}
 
 	Components->dwHostNameLength++;
-	Components->lpszUrlPath = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
-										Components->dwUrlPathLength + 1);
+	Components->lpszUrlPath = ArenaAlloc(Components->dwUrlPathLength + 1);
 	if (!Components->lpszUrlPath) {
 		printf("Failed to allocate URLPath buffer: %d\n", GetLastError());
 		return ERROR_NOT_ENOUGH_MEMORY;
 	}
 
 	Components->dwUrlPathLength++;
-	Components->lpszScheme = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
-									   Components->dwSchemeLength + 1);
+	Components->lpszScheme = ArenaAlloc(Components->dwSchemeLength + 1);
 	if (!Components->lpszScheme) {
 		printf("Failed to allocate URL Scheme buffer: %d\n", GetLastError());
 		return ERROR_NOT_ENOUGH_MEMORY;
@@ -158,7 +156,7 @@ UrlBuildAbsoluteFromRelative(_In_ PSESSION_CONTEXT Ctx, _In_ LPCSTR Relative,
 	InternetCombineUrlA(BaseUrlString, Relative, NULL, &AbsoluteLength,
 						ICU_BROWSER_MODE);
 
-	Absolute = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, AbsoluteLength);
+	Absolute = ArenaAlloc(AbsoluteLength);
 	if (!Absolute)
 		return NULL;
 
@@ -182,16 +180,15 @@ PPAGE
 PageChildrenParseEntry(_In_ PSESSION_CONTEXT Ctx, _In_ PVOID Base,
 					   _In_ DWORD Length)
 {
-	PCHAR Absolute;
-	PCHAR Url;
 	UINT32 Ret;
 	PPAGE Page;
+	PCHAR Url;
 
-	Page = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*Page));
+	Page = ArenaAlloc(sizeof(*Page));
 	if (!Page)
 		return NULL;
 
-	Url = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, Length + 1);
+	Url = ArenaAlloc(Length + 1);
 	if (!Url)
 		return NULL;
 
@@ -199,15 +196,11 @@ PageChildrenParseEntry(_In_ PSESSION_CONTEXT Ctx, _In_ PVOID Base,
 
 	/* If its a relative, rebuild absolute */
 	if (!UrlIsA(Url, URLIS_URL)) {
-		Absolute = UrlBuildAbsoluteFromRelative(Ctx, Url, Length);
-		if (!Absolute) {
+		Url = UrlBuildAbsoluteFromRelative(Ctx, Url, Length);
+		if (!Url) {
 			printf("Failed to build absolute URL: %lu\n", GetLastError());
-			HeapFree(GetProcessHeap(), 0, Url);
 			return NULL;
 		}
-
-		HeapFree(GetProcessHeap(), 0, Url);
-		Url = Absolute;
 	}
 
 	Ret = UrlParse(Url, &Page->Components);
@@ -257,38 +250,33 @@ VOID PageChildrenEnumerate(_In_ PSESSION_CONTEXT Ctx, _In_ PVOID Page)
 	}
 }
 
-#define PAGE_INITIAL_CAPACITY (64 * 1024)
+#define PAGE_READ_CHUNK (64 * 1024)
 
 STATIC
 UINT32 PageChildrenParse(_In_ PSESSION_CONTEXT Ctx, _In_ HINTERNET Request,
 						 _In_ LPURL_COMPONENTSA Url)
 {
-	SIZE_T Capacity = PAGE_INITIAL_CAPACITY;
+	SIZE_T Capacity = PAGE_READ_CHUNK;
 	SIZE_T Length = 0;
 	DWORD BytesRead;
-	PCHAR Grown;
 	PCHAR Page;
 
-	Page = HeapAlloc(GetProcessHeap(), 0, Capacity + 1);
+	Page = ArenaAlloc(Capacity);
 	if (!Page)
 		return ERROR_NOT_ENOUGH_MEMORY;
 
+	/* The last byte is kept free for the NUL terminator */
 	do {
-		if (Length == Capacity) {
-			Capacity *= 2;
-			Grown = HeapReAlloc(GetProcessHeap(), 0, Page, Capacity + 1);
-			if (!Grown) {
-				HeapFree(GetProcessHeap(), 0, Page);
+		if (Capacity - Length == 1) {
+			if (ArenaAlloc(PAGE_READ_CHUNK) != Page + Capacity)
 				return ERROR_NOT_ENOUGH_MEMORY;
-			}
 
-			Page = Grown;
+			Capacity += PAGE_READ_CHUNK;
 		}
 
 		if (!InternetReadFile(Request, Page + Length,
-							  (DWORD)(Capacity - Length), &BytesRead)) {
+							  (DWORD)(Capacity - Length - 1), &BytesRead)) {
 			printf("Failed to read page. %d", GetLastError());
-			HeapFree(GetProcessHeap(), 0, Page);
 			return ERROR_ACCESS_DENIED;
 		}
 
@@ -298,7 +286,6 @@ UINT32 PageChildrenParse(_In_ PSESSION_CONTEXT Ctx, _In_ HINTERNET Request,
 	Page[Length] = '\0';
 	PageChildrenEnumerate(Ctx, Page);
 
-	HeapFree(GetProcessHeap(), 0, Page);
 	return ERROR_SUCCESS;
 }
 
@@ -307,6 +294,12 @@ Scrape(_In_ LPCSTR Url)
 {
 	SESSION_CONTEXT Ctx = { 0 };
 	UINT32 Ret;
+
+	Ret = ArenaInit(16 * 1024 * 1024);
+	if (Ret) {
+		printf("Failed to initialise base allocator");
+		return Ret;
+	}
 
 	Ret = SessionInit(&Ctx, Url);
 	if (Ret) {
@@ -327,6 +320,8 @@ Scrape(_In_ LPCSTR Url)
 		printf("Failed to parse page childen: %d", Ret);
 		return Ret;
 	}
+
+	ArenaDestroy();
 
 	return Ret;
 }
