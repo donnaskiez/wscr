@@ -240,7 +240,7 @@ UrlBuildAbsoluteFromRelative(_In_ PSESSION_CONTEXT Ctx, _In_ LPCSTR Relative,
  * replace it with the NUL terminator.
  */
 STATIC
-VOID UrlStripFragment(_In_ PCHAR Url)
+VOID UrlStripFragment(_Inout_ PCHAR Url)
 {
 	PCHAR Fragment = StrChrA(Url, '#');
 
@@ -289,6 +289,11 @@ PageChildrenParseEntry(_In_ PSESSION_CONTEXT Ctx, _In_ PVOID Base,
 		printf("Failed to parse URL: %u\n", Ret);
 		return NULL;
 	}
+
+	/* Remove URLs that don't match our base hostname */
+	if (StrCmpA(Page->Components.lpszHostName,
+				Ctx->BaseUrl.Components.lpszHostName))
+		return NULL;
 
 	Page->AbsoluteUrl = Url;
 	Page->AbsoluteUrlLength = strlen(Url);
