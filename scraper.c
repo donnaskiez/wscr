@@ -375,7 +375,10 @@ UINT32 PageChildrenParse(_In_ PSESSION_CONTEXT Ctx, _In_ HINTERNET Request,
 	return ERROR_SUCCESS;
 }
 
-/* https://quotes.toscrape.com/ */
+/*
+ * https://quotes.toscrape.com/
+ * https://crawler-test.com/
+ */
 UINT32
 Scrape(_In_ LPCSTR Url)
 {
