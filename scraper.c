@@ -114,7 +114,7 @@ SessionInit(_Out_ PSESSION_CONTEXT Ctx, _In_ LPCSTR Url)
 {
 	UINT32 Ret;
 
-	Ret = UrlParse(Url, &Ctx->BaseUrl);
+	Ret = UrlParse(Url, &Ctx->BaseUrl.Components);
 	if (Ret != ERROR_SUCCESS) {
 		printf("Failed to parse URL: %d\n", Ret);
 		return Ret;
@@ -182,6 +182,7 @@ PPAGE
 PageChildrenParseEntry(_In_ PSESSION_CONTEXT Ctx, _In_ PVOID Base,
 					   _In_ DWORD Length)
 {
+	PCHAR Absolute;
 	PCHAR Url;
 	UINT32 Ret;
 	PPAGE Page;
@@ -198,11 +199,15 @@ PageChildrenParseEntry(_In_ PSESSION_CONTEXT Ctx, _In_ PVOID Base,
 
 	/* If its a relative, rebuild absolute */
 	if (!UrlIsA(Url, URLIS_URL)) {
-		Url = UrlBuildAbsoluteFromRelative(Ctx, Url, Length);
-		if (!Url) {
+		Absolute = UrlBuildAbsoluteFromRelative(Ctx, Url, Length);
+		if (!Absolute) {
 			printf("Failed to build absolute URL: %lu\n", GetLastError());
+			HeapFree(GetProcessHeap(), 0, Url);
 			return NULL;
 		}
+
+		HeapFree(GetProcessHeap(), 0, Url);
+		Url = Absolute;
 	}
 
 	Ret = UrlParse(Url, &Page->Components);
@@ -252,41 +257,48 @@ VOID PageChildrenEnumerate(_In_ PSESSION_CONTEXT Ctx, _In_ PVOID Page)
 	}
 }
 
+#define PAGE_INITIAL_CAPACITY (64 * 1024)
+
 STATIC
 UINT32 PageChildrenParse(_In_ PSESSION_CONTEXT Ctx, _In_ HINTERNET Request,
 						 _In_ LPURL_COMPONENTSA Url)
 {
-	DWORD BufLength = sizeof(DWORD);
-	DWORD ContentLength = 0;
+	SIZE_T Capacity = PAGE_INITIAL_CAPACITY;
+	SIZE_T Length = 0;
 	DWORD BytesRead;
-	PVOID Page;
-	UINT32 Ret;
+	PCHAR Grown;
+	PCHAR Page;
 
-	Ret = HttpQueryInfoA(Request,
-						 HTTP_QUERY_CONTENT_LENGTH | HTTP_QUERY_FLAG_NUMBER,
-						 &ContentLength, &BufLength, NULL);
-	if (!Ret) {
-		printf("Failed to send request: %d", GetLastError());
-		return ERROR_ACCESS_DENIED;
-	}
-
-	Page = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, ContentLength);
+	Page = HeapAlloc(GetProcessHeap(), 0, Capacity + 1);
 	if (!Page)
 		return ERROR_NOT_ENOUGH_MEMORY;
 
-	if (!InternetReadFile(Request, Page, ContentLength, &BytesRead)) {
-		printf("Failed to read page. %d", GetLastError());
-		return ERROR_ACCESS_DENIED;
-	}
+	do {
+		if (Length == Capacity) {
+			Capacity *= 2;
+			Grown = HeapReAlloc(GetProcessHeap(), 0, Page, Capacity + 1);
+			if (!Grown) {
+				HeapFree(GetProcessHeap(), 0, Page);
+				return ERROR_NOT_ENOUGH_MEMORY;
+			}
 
-	if (BytesRead < ContentLength) {
-		printf("Failed to read entire page. ContentLength: %d, BytesRead: %d",
-			   ContentLength, BytesRead);
-		return ERROR_ACCESS_DENIED;
-	}
+			Page = Grown;
+		}
 
+		if (!InternetReadFile(Request, Page + Length,
+							  (DWORD)(Capacity - Length), &BytesRead)) {
+			printf("Failed to read page. %d", GetLastError());
+			HeapFree(GetProcessHeap(), 0, Page);
+			return ERROR_ACCESS_DENIED;
+		}
+
+		Length += BytesRead;
+	} while (BytesRead);
+
+	Page[Length] = '\0';
 	PageChildrenEnumerate(Ctx, Page);
 
+	HeapFree(GetProcessHeap(), 0, Page);
 	return ERROR_SUCCESS;
 }
 

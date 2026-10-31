@@ -131,6 +131,7 @@
   <ItemGroup>
     <ClCompile Include="main.c" />
     <ClCompile Include="scraper.c" />
+    <ClCompile Include="arena.c" />
   </ItemGroup>
   <ItemGroup>
     <None Include=".clang-format" />
