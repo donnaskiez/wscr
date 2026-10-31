@@ -30,5 +30,8 @@
     <ClInclude Include="scraper.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="arena.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>

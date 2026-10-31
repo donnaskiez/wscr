@@ -168,12 +168,13 @@ UrlBuildAbsoluteFromRelative(_In_ PSESSION_CONTEXT Ctx, _In_ LPCSTR Relative,
 		return NULL;
 	}
 
-	printf("AbsoluteURL: %s\n", Absolute);
 	return Absolute;
 }
 
 typedef struct _PAGE {
 	URL_COMPONENTSA Components;
+	PCHAR AbsoluteUrl;
+	DWORD AbsoluteUrlLength;
 } PAGE, *PPAGE;
 
 STATIC
@@ -181,8 +182,7 @@ PPAGE
 PageChildrenParseEntry(_In_ PSESSION_CONTEXT Ctx, _In_ PVOID Base,
 					   _In_ DWORD Length)
 {
-	PVOID AbsoluteUrl;
-	PCHAR String;
+	PCHAR Url;
 	UINT32 Ret;
 	PPAGE Page;
 
@@ -190,33 +190,29 @@ PageChildrenParseEntry(_In_ PSESSION_CONTEXT Ctx, _In_ PVOID Base,
 	if (!Page)
 		return NULL;
 
-	String = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, Length + 1);
-	if (!String)
+	Url = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, Length + 1);
+	if (!Url)
 		return NULL;
 
-	RtlCopyMemory(String, Base, Length);
+	RtlCopyMemory(Url, Base, Length);
 
-	/* Check if it is already an absolute URL */
-	if (UrlIsA(String, URLIS_URL)) {
-		Ret = UrlParse(String, &Page->Components);
-		if (Ret != ERROR_SUCCESS) {
-			printf("Failed to parse URL: %d\n", Ret);
-			return NULL;
-		}
-	} else {
-		AbsoluteUrl = UrlBuildAbsoluteFromRelative(Ctx, String, Length);
-		if (!AbsoluteUrl) {
-			printf("Failed to build absolute URL: %d", GetLastError());
-			return NULL;
-		}
-
-		Ret = UrlParse(AbsoluteUrl, &Page->Components);
-		if (Ret != ERROR_SUCCESS) {
-			printf("Failed to parse combined URL components: %d\n", Ret);
+	/* If its a relative, rebuild absolute */
+	if (!UrlIsA(Url, URLIS_URL)) {
+		Url = UrlBuildAbsoluteFromRelative(Ctx, Url, Length);
+		if (!Url) {
+			printf("Failed to build absolute URL: %lu\n", GetLastError());
 			return NULL;
 		}
 	}
 
+	Ret = UrlParse(Url, &Page->Components);
+	if (Ret != ERROR_SUCCESS) {
+		printf("Failed to parse URL: %u\n", Ret);
+		return NULL;
+	}
+
+	Page->AbsoluteUrl = Url;
+	Page->AbsoluteUrlLength = strlen(Url);
 	return Page;
 }
 
@@ -225,6 +221,7 @@ VOID PageChildrenEnumerate(_In_ PSESSION_CONTEXT Ctx, _In_ PVOID Page)
 {
 	PCHAR PageIndex = (PCHAR)Page;
 	PCHAR String = "a href=\"";
+	PPAGE ChildPage;
 
 	while (TRUE) {
 		PCHAR Href = StrStrA(PageIndex, String);
@@ -245,7 +242,11 @@ VOID PageChildrenEnumerate(_In_ PSESSION_CONTEXT Ctx, _In_ PVOID Page)
 		/* Subtract offset for length of URL */
 		UrlLen = UrlEnd - Href;
 
-		PageChildrenParseEntry(Ctx, Href, UrlLen);
+		ChildPage = PageChildrenParseEntry(Ctx, Href, UrlLen);
+		if (ChildPage) {
+			printf("AbsoluteURL: %s\n", ChildPage->AbsoluteUrl);
+			printf("AbsoluteURL Length: %d\n", ChildPage->AbsoluteUrlLength);
+		}
 
 		PageIndex += ((Href - PageIndex) + UrlLen);
 	}
