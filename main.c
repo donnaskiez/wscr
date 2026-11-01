@@ -69,7 +69,7 @@ ArenaInit(SIZE_T Size)
 }
 
 typedef struct _PAGE {
-	struct _PAGE *Next;
+	struct _PAGE *BucketNext;
 	URL_COMPONENTSA Components;
 	PCHAR AbsoluteUrl;
 	DWORD AbsoluteUrlLength;
@@ -85,6 +85,13 @@ typedef struct _PAGE {
 typedef struct _HASH_SET {
 	PPAGE *BucketArray;
 	UINT32 BucketCount;
+
+	/*
+	 * We can probably use a more granular approach such as per
+	 * bucket locking, but I don't think access to the hashset
+	 * is our limiting factor here.
+	 */
+	SRWLOCK Lock;
 } HASH_SET, *PHASH_SET;
 
 #define FNV_HASH_OFFSET_BASIS 0xcbf29ce484222325
@@ -131,13 +138,18 @@ HashSetAddOrContains(_In_ PHASH_SET Set, _In_ PPAGE Page)
 	Page->AbsoluteUrlHash = HashSetHash(Page);
 	BucketIdx = (UINT32)(Page->AbsoluteUrlHash & (Set->BucketCount - 1));
 
-	for (Cur = Set->BucketArray[BucketIdx]; Cur; Cur = Cur->Next) {
-		if (HashSetPageEquivalent(Cur, Page))
+	AcquireSRWLockExclusive(&Set->Lock);
+
+	for (Cur = Set->BucketArray[BucketIdx]; Cur; Cur = Cur->BucketNext) {
+		if (HashSetPageEquivalent(Cur, Page)) {
+			ReleaseSRWLockExclusive(&Set->Lock);
 			return HASH_SET_PAGE_EXIST;
+		}
 	}
 
-	Page->Next = Set->BucketArray[BucketIdx];
+	Page->BucketNext = Set->BucketArray[BucketIdx];
 	Set->BucketArray[BucketIdx] = Page;
+	ReleaseSRWLockExclusive(&Set->Lock);
 	return HASH_SET_PAGE_ADDED;
 }
 
@@ -151,8 +163,14 @@ HashSetInit(_Out_ PHASH_SET Set)
 		return ERROR_NOT_ENOUGH_MEMORY;
 
 	Set->BucketCount = HASH_SET_DEFAULT_BUCKET_COUNT;
+	InitializeSRWLock(&Set->Lock);
 	return ERROR_SUCCESS;
 }
+
+typedef struct _THREAD_POOL {
+	PHANDLE ThreadHandles;
+	DWORD ThreadCount;
+} THREAD_POOL, *PTHREAD_POOL;
 
 typedef struct _SESSION_CONTEXT {
 	HINTERNET SessionHandle;
@@ -163,27 +181,103 @@ typedef struct _SESSION_CONTEXT {
 	} BaseUrl;
 
 	HASH_SET Set;
+	THREAD_POOL Pool;
 
 } SESSION_CONTEXT, *PSESSION_CONTEXT;
 
 STATIC
+VOID ThreadPoolDeInit(_In_ PTHREAD_POOL Tp)
+{
+	UINT32 Idx;
+
+	for (Idx = 0; Idx < Tp->ThreadCount; Idx++) {
+		if (Tp->ThreadHandles[Idx])
+			CloseHandle(Tp->ThreadHandles[Idx]);
+	}
+}
+
+DWORD WINAPI ThreadPoolWorker(_In_ LPVOID Parameter)
+{
+	PSESSION_CONTEXT Ctx = (PSESSION_CONTEXT)Parameter;
+
+	printf("Executing pool worker thread. TID: %d\n", GetCurrentThreadId());
+
+	return ERROR_SUCCESS;
+}
+
+STATIC
+UINT32
+ThreadPoolInit(_In_ PSESSION_CONTEXT Ctx, _Out_ PTHREAD_POOL Tp)
+{
+	UINT32 Idx;
+
+	Tp->ThreadCount = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+	Tp->ThreadHandles =
+			ArenaAlloc(Tp->ThreadCount * sizeof(*Tp->ThreadHandles));
+	if (!Tp->ThreadHandles)
+		return ERROR_NOT_ENOUGH_MEMORY;
+
+	for (Idx = 0; Idx < Tp->ThreadCount; Idx++) {
+		Tp->ThreadHandles[Idx] =
+				CreateThread(NULL, 0, ThreadPoolWorker, Ctx, 0, NULL);
+		if (!Tp->ThreadHandles[Idx])
+			goto error;
+	}
+
+	return ERROR_SUCCESS;
+
+error:
+	ThreadPoolDeInit(Tp);
+	return ERROR_TOO_MANY_THREADS;
+}
+
+/*
+ * Rather then reformatting the string, find the fragment '#' and
+ * replace it with the NUL terminator.
+ */
+STATIC
+VOID UrlStripFragment(_Inout_ PCHAR Url)
+{
+	PCHAR Fragment = StrChrA(Url, '#');
+
+	if (Fragment)
+		*Fragment = '\0';
+}
+
+/* https://www.rfc-editor.org/info/rfc9110/#section-15.4 */
+#define HTTP_STATUS_IS_REDIRECT(Status) \
+	((Status) >= HTTP_STATUS_AMBIGUOUS && (Status) < HTTP_STATUS_BAD_REQUEST)
+
+STATIC
 UINT32
 UrlDownload(_In_ PSESSION_CONTEXT Ctx, _In_ LPURL_COMPONENTSA Url,
-			_Out_ LPHINTERNET RequestHandle)
+			_Out_ LPHINTERNET RequestHandle, _Out_ PDWORD StatusCode)
 {
-	DWORD Flags = INTERNET_FLAG_NO_CACHE_WRITE;
+	DWORD Flags = INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_NO_AUTO_REDIRECT;
+	SIZE_T PathLength = strlen(Url->lpszUrlPath);
+	SIZE_T ExtraLength = strlen(Url->lpszExtraInfo);
 	DWORD BufLength = sizeof(DWORD);
 	DWORD ContentLength = 0;
-	DWORD StatusCode = 0;
 	UINT32 Status;
+	PCHAR Object;
 	BOOL Ret;
+
+	*RequestHandle = NULL;
+	*StatusCode = 0;
 
 	if (Url->nScheme == INTERNET_SCHEME_HTTPS)
 		Flags |= INTERNET_FLAG_SECURE;
 
-	*RequestHandle = HttpOpenRequestA(Ctx->ConnectionHandle, "GET",
-									  Url->lpszUrlPath, NULL, NULL, NULL, Flags,
-									  NULL);
+	Object = ArenaAlloc(PathLength + ExtraLength + 1);
+	if (!Object)
+		return ERROR_NOT_ENOUGH_MEMORY;
+
+	RtlCopyMemory(Object, Url->lpszUrlPath, PathLength);
+	RtlCopyMemory(Object + PathLength, Url->lpszExtraInfo, ExtraLength);
+	UrlStripFragment(Object);
+
+	*RequestHandle = HttpOpenRequestA(Ctx->ConnectionHandle, "GET", Object,
+									  NULL, NULL, NULL, Flags, NULL);
 	if (!*RequestHandle) {
 		printf("Failed to open HttpRequest handle: %d", GetLastError());
 		return ERROR_BAD_ARGUMENTS;
@@ -198,15 +292,17 @@ UrlDownload(_In_ PSESSION_CONTEXT Ctx, _In_ LPURL_COMPONENTSA Url,
 
 	Ret = HttpQueryInfoA(*RequestHandle,
 						 HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER,
-						 &StatusCode, &BufLength, NULL);
+						 StatusCode, &BufLength, NULL);
 	if (!Ret) {
 		printf("Failied to query status code: %d", GetLastError());
 		Status = ERROR_ACCESS_DENIED;
 		goto request_fail;
 	}
 
-	if (StatusCode != HTTP_STATUS_OK) {
-		printf("HTTPS Query Failed. Status: %d", StatusCode);
+	/* Redirects are handed back so the Location goes through the link path */
+	if (*StatusCode != HTTP_STATUS_OK &&
+		!HTTP_STATUS_IS_REDIRECT(*StatusCode)) {
+		printf("HTTPS Query Failed. Status: %d", *StatusCode);
 		Status = ERROR_ACCESS_DENIED;
 		goto request_fail;
 	}
@@ -320,30 +416,25 @@ SessionInit(_Out_ PSESSION_CONTEXT Ctx, _In_ LPCSTR Url)
 	return ERROR_SUCCESS;
 }
 
+/*
+ * Relative links resolve against the page they were found on, so the base
+ * is that page's URL rather than the crawl base URL
+ */
 STATIC
 PVOID
-UrlBuildAbsoluteFromRelative(_In_ PSESSION_CONTEXT Ctx, _In_ LPCSTR Relative,
-							 _In_ DWORD Length)
+UrlBuildAbsoluteFromRelative(_In_ LPCSTR PageUrl, _In_ LPCSTR Relative)
 {
-	CHAR BaseUrlString[INTERNET_MAX_URL_LENGTH] = { 0 };
-	DWORD BaseUrlLength = INTERNET_MAX_URL_LENGTH;
 	DWORD AbsoluteLength = 0;
 	PCHAR Absolute;
 
-	if (!InternetCreateUrlA(&Ctx->BaseUrl.Components, 0, BaseUrlString,
-							&BaseUrlLength)) {
-		printf("Failed to rebuild base URL string: %d\n", GetLastError());
-		return NULL;
-	}
-
-	InternetCombineUrlA(BaseUrlString, Relative, NULL, &AbsoluteLength,
+	InternetCombineUrlA(PageUrl, Relative, NULL, &AbsoluteLength,
 						ICU_BROWSER_MODE);
 
 	Absolute = ArenaAlloc(AbsoluteLength);
 	if (!Absolute)
 		return NULL;
 
-	if (!InternetCombineUrlA(BaseUrlString, Relative, Absolute, &AbsoluteLength,
+	if (!InternetCombineUrlA(PageUrl, Relative, Absolute, &AbsoluteLength,
 							 ICU_BROWSER_MODE)) {
 		printf("InternetCombineUrlA failed: %d\n", GetLastError());
 		return NULL;
@@ -352,23 +443,10 @@ UrlBuildAbsoluteFromRelative(_In_ PSESSION_CONTEXT Ctx, _In_ LPCSTR Relative,
 	return Absolute;
 }
 
-/*
- * Rather then reformatting the string, find the fragment '#' and
- * replace it with the NUL terminator.
- */
-STATIC
-VOID UrlStripFragment(_Inout_ PCHAR Url)
-{
-	PCHAR Fragment = StrChrA(Url, '#');
-
-	if (Fragment)
-		*Fragment = '\0';
-}
-
 STATIC
 PPAGE
-PageChildrenParseEntry(_In_ PSESSION_CONTEXT Ctx, _In_ PVOID Base,
-					   _In_ DWORD Length)
+PageChildrenParseEntry(_In_ PSESSION_CONTEXT Ctx, _In_ LPCSTR PageUrl,
+					   _In_ PVOID Base, _In_ DWORD Length)
 {
 	UINT32 Ret;
 	PPAGE Page;
@@ -386,7 +464,7 @@ PageChildrenParseEntry(_In_ PSESSION_CONTEXT Ctx, _In_ PVOID Base,
 
 	/* If its a relative, rebuild absolute */
 	if (!UrlIsA(Url, URLIS_URL)) {
-		Url = UrlBuildAbsoluteFromRelative(Ctx, Url, Length);
+		Url = UrlBuildAbsoluteFromRelative(PageUrl, Url);
 		if (!Url) {
 			printf("Failed to build absolute URL: %lu\n", GetLastError());
 			return NULL;
@@ -414,12 +492,27 @@ PageChildrenParseEntry(_In_ PSESSION_CONTEXT Ctx, _In_ PVOID Base,
 }
 
 STATIC
-VOID PageChildrenEnumerate(_In_ PSESSION_CONTEXT Ctx, _In_ PVOID Page)
+VOID PageChildrenAddEntry(_In_ PSESSION_CONTEXT Ctx, _In_ LPCSTR PageUrl,
+						  _In_ PVOID Base, _In_ DWORD Length)
+{
+	PPAGE ChildPage;
+
+	ChildPage = PageChildrenParseEntry(Ctx, PageUrl, Base, Length);
+	if (!ChildPage)
+		return;
+
+	if (HashSetAddOrContains(&Ctx->Set, ChildPage) == HASH_SET_PAGE_EXIST)
+		return;
+
+	printf("Adding new page to queue!\n");
+}
+
+STATIC
+VOID PageChildrenEnumerate(_In_ PSESSION_CONTEXT Ctx, _In_ LPCSTR PageUrl,
+						   _In_ PVOID Page)
 {
 	PCHAR PageIndex = (PCHAR)Page;
 	PCHAR String = "a href=\"";
-	PPAGE ChildPage;
-	UINT8 Ret;
 
 	while (TRUE) {
 		PCHAR Href = StrStrA(PageIndex, String);
@@ -440,16 +533,8 @@ VOID PageChildrenEnumerate(_In_ PSESSION_CONTEXT Ctx, _In_ PVOID Page)
 		/* Subtract offset for length of URL */
 		UrlLen = UrlEnd - Href;
 
-		ChildPage = PageChildrenParseEntry(Ctx, Href, UrlLen);
-		if (ChildPage) {
-			Ret = HashSetAddOrContains(&Ctx->Set, ChildPage);
-			if (Ret == HASH_SET_PAGE_EXIST)
-				goto increment;
+		PageChildrenAddEntry(Ctx, PageUrl, Href, UrlLen);
 
-			printf("Adding new page to queue!\n");
-		}
-
-increment:
 		PageIndex += ((Href - PageIndex) + UrlLen);
 	}
 }
@@ -458,7 +543,7 @@ increment:
 
 STATIC
 UINT32 PageChildrenParse(_In_ PSESSION_CONTEXT Ctx, _In_ HINTERNET Request,
-						 _In_ LPURL_COMPONENTSA Url)
+						 _In_ LPCSTR PageUrl)
 {
 	SIZE_T Capacity = PAGE_READ_CHUNK;
 	SIZE_T Length = 0;
@@ -488,7 +573,7 @@ UINT32 PageChildrenParse(_In_ PSESSION_CONTEXT Ctx, _In_ HINTERNET Request,
 	} while (BytesRead);
 
 	Page[Length] = '\0';
-	PageChildrenEnumerate(Ctx, Page);
+	PageChildrenEnumerate(Ctx, PageUrl, Page);
 
 	return ERROR_SUCCESS;
 }
@@ -503,6 +588,7 @@ Scrape(_In_ LPCSTR Url)
 {
 	SESSION_CONTEXT Ctx = { 0 };
 	HINTERNET Request = NULL;
+	DWORD StatusCode;
 	UINT32 Ret;
 
 	Ret = ArenaInit(16 * 1024 * 1024);
@@ -517,19 +603,25 @@ Scrape(_In_ LPCSTR Url)
 		goto hash_set_fail;
 	}
 
+	Ret = ThreadPoolInit(&Ctx, &Ctx.Pool);
+	if (Ret) {
+		printf("Failed to initialise threadpool: %d", Ret);
+		goto thread_pool_fail;
+	}
+
 	Ret = SessionInit(&Ctx, Url);
 	if (Ret) {
 		printf("Failed to initialise session: %d", Ret);
 		goto session_init_fail;
 	}
 
-	Ret = UrlDownload(&Ctx, &Ctx.BaseUrl.Components, &Request);
+	Ret = UrlDownload(&Ctx, &Ctx.BaseUrl.Components, &Request, &StatusCode);
 	if (Ret) {
 		printf("Failed to download URL: %d", Ret);
 		goto url_dl_fail;
 	}
 
-	Ret = PageChildrenParse(&Ctx, Request, &Ctx.BaseUrl.Components);
+	Ret = PageChildrenParse(&Ctx, Request, Url);
 	if (Ret) {
 		printf("Failed to parse page childen: %d", Ret);
 		goto page_parse_fail;
@@ -539,7 +631,9 @@ page_parse_fail:
 	InternetCloseHandle(Request);
 url_dl_fail:
 session_init_fail:
+	ThreadPoolDeInit(&Ctx.Pool);
 	SessionDeInit(&Ctx);
+thread_pool_fail:
 hash_set_fail:
 	ArenaDestroy();
 	return Ret;
