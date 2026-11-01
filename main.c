@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <wininet.h>
 #include <shlwapi.h>
 
@@ -18,6 +19,22 @@ __declspec(thread) ARENA_CONTEXT ArenaContext = { 0 };
 #define PAGE_SIZE 4096
 #define STATIC static
 #define DEFAULT_ARENA_ALLOC_SIZE 16 * 1024 * 1024
+
+STATIC
+VOID Log(_In_z_ _Printf_format_string_ LPCSTR Format, ...)
+{
+	CHAR Message[1024];
+	SYSTEMTIME Time;
+	va_list Args;
+
+	va_start(Args, Format);
+	vsnprintf(Message, sizeof(Message), Format, Args);
+	va_end(Args);
+
+	GetLocalTime(&Time);
+	printf("[%02u:%02u:%02u.%03u] [%5lu] %s\n", Time.wHour, Time.wMinute,
+		   Time.wSecond, Time.wMilliseconds, GetCurrentThreadId(), Message);
+}
 
 STATIC
 VOID ArenaDeInit()
@@ -99,12 +116,16 @@ PPAGE QueuePop(_In_ PPAGE_QUEUE Queue)
 	while (!Queue->Head && !Queue->Terminate)
 		SleepConditionVariableSRW(&Queue->CondVar, &Queue->Lock, INFINITE, 0);
 
+	if (!Queue->Head)
+		goto unlock;
+
 	Page = Queue->Head;
 	Queue->Head = Page->QueueNext;
 
 	if (!Queue->Head)
 		Queue->Tail = NULL;
 
+unlock:
 	ReleaseSRWLockExclusive(&Queue->Lock);
 	return Page;
 }
@@ -137,7 +158,7 @@ VOID QueueDeInit(_Out_ PPAGE_QUEUE Queue)
 	AcquireSRWLockExclusive(&Queue->Lock);
 	Queue->Terminate = TRUE;
 	WakeAllConditionVariable(&Queue->CondVar);
-	WakeConditionVariable(&Queue->CondVar);
+	ReleaseSRWLockExclusive(&Queue->Lock);
 }
 
 STATIC
@@ -304,14 +325,14 @@ UrlDownload(_In_ PSESSION_CONTEXT Ctx, _In_ LPURL_COMPONENTSA Url,
 	*RequestHandle = HttpOpenRequestA(Ctx->ConnectionHandle, "GET", Object,
 									  NULL, NULL, NULL, Flags, NULL);
 	if (!*RequestHandle) {
-		printf("Failed to open HttpRequest handle: %d\n", GetLastError());
+		Log("Failed to open HttpRequest handle: %d", GetLastError());
 		return ERROR_BAD_ARGUMENTS;
 	}
 
 	Ret = HttpSendRequestA(*RequestHandle, NULL, 0, NULL, 0);
 	if (!Ret) {
 		Status = GetLastError();
-		printf("Failed to send HttpRequest: %u\n", Status);
+		Log("Failed to send HttpRequest: %u", Status);
 		goto request_fail;
 	}
 
@@ -319,7 +340,7 @@ UrlDownload(_In_ PSESSION_CONTEXT Ctx, _In_ LPURL_COMPONENTSA Url,
 						 HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER,
 						 StatusCode, &BufLength, NULL);
 	if (!Ret) {
-		printf("Failied to query status code: %d\n", GetLastError());
+		Log("Failied to query status code: %d", GetLastError());
 		Status = ERROR_ACCESS_DENIED;
 		goto request_fail;
 	}
@@ -327,7 +348,7 @@ UrlDownload(_In_ PSESSION_CONTEXT Ctx, _In_ LPURL_COMPONENTSA Url,
 	/* Redirects are handed back so the Location goes through the link path */
 	if (*StatusCode != HTTP_STATUS_OK &&
 		!HTTP_STATUS_IS_REDIRECT(*StatusCode)) {
-		printf("HTTPS Query Failed. Status: %d\n", *StatusCode);
+		Log("HTTPS Query Failed. Status: %d", *StatusCode);
 		Status = ERROR_ACCESS_DENIED;
 		goto request_fail;
 	}
@@ -358,35 +379,34 @@ UrlParse(_In_ LPCSTR Url, _Out_ LPURL_COMPONENTSA Components)
 
 	Ret = InternetCrackUrlA(Url, (DWORD)strlen(Url), 0, Components);
 	if (!Ret) {
-		printf("Failed to retrieve required buf sizes: %d\n", GetLastError());
+		Log("Failed to retrieve required buf sizes: %d", GetLastError());
 		return ERROR_BAD_ARGUMENTS;
 	}
 
 	Components->lpszHostName = ArenaAlloc(Components->dwHostNameLength + 1);
 	if (!Components->lpszHostName) {
-		printf("Failed to allocate HostName buffer: %d\n", GetLastError());
+		Log("Failed to allocate HostName buffer: %d", GetLastError());
 		return ERROR_NOT_ENOUGH_MEMORY;
 	}
 
 	Components->dwHostNameLength++;
 	Components->lpszUrlPath = ArenaAlloc(Components->dwUrlPathLength + 1);
 	if (!Components->lpszUrlPath) {
-		printf("Failed to allocate URLPath buffer: %d\n", GetLastError());
+		Log("Failed to allocate URLPath buffer: %d", GetLastError());
 		return ERROR_NOT_ENOUGH_MEMORY;
 	}
 
 	Components->dwUrlPathLength++;
 	Components->lpszScheme = ArenaAlloc(Components->dwSchemeLength + 1);
 	if (!Components->lpszScheme) {
-		printf("Failed to allocate URL Scheme buffer: %d\n", GetLastError());
+		Log("Failed to allocate URL Scheme buffer: %d", GetLastError());
 		return ERROR_NOT_ENOUGH_MEMORY;
 	}
 
 	Components->dwSchemeLength++;
 	Components->lpszExtraInfo = ArenaAlloc(Components->dwExtraInfoLength + 1);
 	if (!Components->lpszExtraInfo) {
-		printf("Failed to allocate URL Extra Info buffer: %d\n",
-			   GetLastError());
+		Log("Failed to allocate URL Extra Info buffer: %d", GetLastError());
 		return ERROR_NOT_ENOUGH_MEMORY;
 	}
 
@@ -394,7 +414,7 @@ UrlParse(_In_ LPCSTR Url, _Out_ LPURL_COMPONENTSA Components)
 
 	Ret = InternetCrackUrlA(Url, (DWORD)strlen(Url), 0, Components);
 	if (!Ret) {
-		printf("Failed to parse URL: %d\n", GetLastError());
+		Log("Failed to parse URL: %d", GetLastError());
 		return ERROR_BAD_ARGUMENTS;
 	}
 
@@ -418,14 +438,14 @@ SessionInit(_Out_ PSESSION_CONTEXT Ctx, _In_ LPCSTR Url)
 
 	Ret = UrlParse(Url, &Ctx->BaseUrl.Components);
 	if (Ret != ERROR_SUCCESS) {
-		printf("Failed to parse URL: %d\n", Ret);
+		Log("Failed to parse URL: %d", Ret);
 		return Ret;
 	}
 
 	Ctx->SessionHandle = InternetOpenA("WinInet", INTERNET_OPEN_TYPE_PRECONFIG,
 									   NULL, NULL, 0);
 	if (!Ctx->SessionHandle) {
-		printf("Failed to open SessionHandle: %d\n", GetLastError());
+		Log("Failed to open SessionHandle: %d", GetLastError());
 		return GetLastError();
 	}
 
@@ -434,7 +454,7 @@ SessionInit(_Out_ PSESSION_CONTEXT Ctx, _In_ LPCSTR Url)
 			Ctx->BaseUrl.Components.nPort, NULL, NULL, INTERNET_SERVICE_HTTP, 0,
 			NULL);
 	if (!Ctx->ConnectionHandle) {
-		printf("Failed to open ConnectionHandle: %d\n", GetLastError());
+		Log("Failed to open ConnectionHandle: %d", GetLastError());
 		return GetLastError();
 	}
 
@@ -461,7 +481,7 @@ UrlBuildAbsoluteFromRelative(_In_ LPCSTR PageUrl, _In_ LPCSTR Relative)
 
 	if (!InternetCombineUrlA(PageUrl, Relative, Absolute, &AbsoluteLength,
 							 ICU_BROWSER_MODE)) {
-		printf("InternetCombineUrlA failed: %d\n", GetLastError());
+		Log("InternetCombineUrlA failed: %d", GetLastError());
 		return NULL;
 	}
 
@@ -491,7 +511,7 @@ PageChildrenParseEntry(_In_ PSESSION_CONTEXT Ctx, _In_ LPCSTR PageUrl,
 	if (!UrlIsA(Url, URLIS_URL)) {
 		Url = UrlBuildAbsoluteFromRelative(PageUrl, Url);
 		if (!Url) {
-			printf("Failed to build absolute URL: %lu\n", GetLastError());
+			Log("Failed to build absolute URL: %lu", GetLastError());
 			return NULL;
 		}
 	}
@@ -502,7 +522,7 @@ PageChildrenParseEntry(_In_ PSESSION_CONTEXT Ctx, _In_ LPCSTR PageUrl,
 
 	Ret = UrlParse(Url, &Page->Components);
 	if (Ret != ERROR_SUCCESS) {
-		printf("Failed to parse URL: %u\n", Ret);
+		Log("Failed to parse URL: %u", Ret);
 		return NULL;
 	}
 
@@ -590,7 +610,7 @@ UINT32 PageChildrenParse(_In_ PSESSION_CONTEXT Ctx, _In_ HINTERNET Request,
 
 		if (!InternetReadFile(Request, Page + Length,
 							  (DWORD)(Capacity - Length - 1), &BytesRead)) {
-			printf("Failed to read page. %d\n", GetLastError());
+			Log("Failed to read page. %d", GetLastError());
 			return ERROR_ACCESS_DENIED;
 		}
 
@@ -627,13 +647,13 @@ ThreadPoolWorkerHandlePage(_In_ PSESSION_CONTEXT Ctx, _In_ PPAGE Page)
 
 	Ret = UrlDownload(Ctx, &Page->Components, &Request, &StatusCode);
 	if (Ret) {
-		printf("Failed to download URL: %d\n", Ret);
+		Log("Failed to download URL: %d", Ret);
 		return Ret;
 	}
 
-	Ret = PageChildrenParse(&Ctx, Request, Page->AbsoluteUrl);
+	Ret = PageChildrenParse(Ctx, Request, Page->AbsoluteUrl);
 	if (Ret) {
-		printf("Failed to parse page childen: %d\n", Ret);
+		Log("Failed to parse page childen: %d", Ret);
 		goto page_parse_fail;
 	}
 
@@ -648,26 +668,24 @@ DWORD WINAPI ThreadPoolWorker(_In_ LPVOID Parameter)
 	PPAGE Page;
 	UINT32 Ret;
 
-	printf("Executing pool worker thread. TID: %d\n", GetCurrentThreadId());
+	Log("Executing pool worker thread");
 
 	Ret = ArenaInit(DEFAULT_ARENA_ALLOC_SIZE);
 	if (Ret) {
-		printf("Failed to initialise allocator on TID: %d\n",
-			   GetCurrentThreadId());
+		Log("Failed to initialise allocator: %u", Ret);
 		return Ret;
 	}
 
 	while ((Page = QueuePop(&Ctx->Queue))) {
-		printf("TID: %d: Page: %s\n", GetCurrentThreadId(), Page->AbsoluteUrl);
+		Log("Page: %s", Page->AbsoluteUrl);
 		Ret = ThreadPoolWorkerHandlePage(Ctx, Page);
 		if (Ret) {
-			printf("ThreadPool: Failed to handle page. TID: %d\n",
-				   GetCurrentThreadId());
+			Log("ThreadPool: Failed to handle page");
 			continue;
 		}
 	}
 
-	printf("Terminating worker thread. TIP: %d\n", GetCurrentThreadId());
+	Log("Terminating worker thread");
 	ArenaDeInit();
 	return ERROR_SUCCESS;
 }
@@ -704,6 +722,7 @@ ThreadPoolInit(_In_ PSESSION_CONTEXT Ctx, _Out_ PTHREAD_POOL Tp)
 	return ERROR_SUCCESS;
 
 error:
+	QueueDeInit(&Ctx->Queue);
 	ThreadPoolDeInit(Tp);
 	return ERROR_TOO_MANY_THREADS;
 }
@@ -723,19 +742,19 @@ Scrape(_In_ LPCSTR Url)
 
 	Ret = ArenaInit(DEFAULT_ARENA_ALLOC_SIZE);
 	if (Ret) {
-		printf("Failed to initialise base allocator\n");
+		Log("Failed to initialise base allocator");
 		return Ret;
 	}
 
 	Ret = HashSetInit(&Ctx.Set);
 	if (Ret) {
-		printf("Failed to initialise HashSet\n");
+		Log("Failed to initialise HashSet");
 		goto hash_set_fail;
 	}
 
 	Ret = SessionInit(&Ctx, Url);
 	if (Ret) {
-		printf("Failed to initialise session: %d\n", Ret);
+		Log("Failed to initialise session: %d", Ret);
 		goto session_init_fail;
 	}
 
@@ -744,28 +763,29 @@ Scrape(_In_ LPCSTR Url)
 	/* Workers use the session, so they start after it and stop before it */
 	Ret = ThreadPoolInit(&Ctx, &Ctx.Pool);
 	if (Ret) {
-		printf("Failed to initialise threadpool: %d\n", Ret);
+		Log("Failed to initialise threadpool: %d", Ret);
 		goto thread_pool_fail;
 	}
 
 	Ret = UrlDownload(&Ctx, &Ctx.BaseUrl.Components, &Request, &StatusCode);
 	if (Ret) {
-		printf("Failed to download URL: %d\n", Ret);
+		Log("Failed to download URL: %d", Ret);
 		goto url_dl_fail;
 	}
 
 	Ret = PageChildrenParse(&Ctx, Request, Url);
 	if (Ret) {
-		printf("Failed to parse page childen: %d\n", Ret);
+		Log("Failed to parse page childen: %d", Ret);
 		goto page_parse_fail;
 	}
 
 page_parse_fail:
 	InternetCloseHandle(Request);
 url_dl_fail:
+	/* Close the queue first so sleeping workers wake up and exit */
+	QueueDeInit(&Ctx.Queue);
 	ThreadPoolDeInit(&Ctx.Pool);
 thread_pool_fail:
-	QueueDeInit(&Ctx.Queue);
 session_init_fail:
 	SessionDeInit(&Ctx);
 hash_set_fail:
@@ -776,9 +796,9 @@ hash_set_fail:
 INT WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance,
 				   _In_ LPSTR lpCmdLine, _In_ INT nShowCmd)
 {
-	printf("arg count: %d\n", __argc);
+	Log("arg count: %d", __argc);
 	if (__argc > 1)
-		printf("%s\n", __argv[1]);
+		Log("%s", __argv[1]);
 
 	Scrape(__argv[1]);
 
