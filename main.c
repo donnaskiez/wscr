@@ -18,6 +18,7 @@ __declspec(thread) ARENA_CONTEXT ArenaContext = { 0 };
 #define PAGE_SIZE 4096
 #define STATIC static
 
+STATIC
 VOID ArenaDestroy()
 {
 	if (ArenaContext.Base)
@@ -26,6 +27,7 @@ VOID ArenaDestroy()
 	RtlZeroMemory(&ArenaContext, sizeof(ArenaContext));
 }
 
+STATIC
 PVOID
 ArenaAlloc(SIZE_T Size)
 {
@@ -44,6 +46,7 @@ ArenaAlloc(SIZE_T Size)
 	return Block;
 }
 
+STATIC
 UINT32
 ArenaInit(SIZE_T Size)
 {
@@ -384,6 +387,7 @@ UINT32 PageChildrenParse(_In_ PSESSION_CONTEXT Ctx, _In_ HINTERNET Request,
  * https://quotes.toscrape.com/
  * https://crawler-test.com/
  */
+STATIC
 UINT32
 Scrape(_In_ LPCSTR Url)
 {
