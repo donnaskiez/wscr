@@ -70,15 +70,72 @@ ArenaInit(SIZE_T Size)
 
 typedef struct _PAGE {
 	struct _PAGE *BucketNext;
+	struct _PAGE *QueueNext;
 	URL_COMPONENTSA Components;
 	PCHAR AbsoluteUrl;
 	DWORD AbsoluteUrlLength;
 	UINT64 AbsoluteUrlHash;
 } PAGE, *PPAGE;
 
-//typedef struct _PAGE_QUEUE {
-//
-//}PAGE_QUEUE, *PPAGE_QUEUE;
+typedef struct _PAGE_QUEUE {
+	struct _PAGE *Head;
+	struct _PAGE *Tail;
+	SRWLOCK Lock;
+	CONDITION_VARIABLE CondVar;
+
+} PAGE_QUEUE, *PPAGE_QUEUE;
+
+STATIC
+PPAGE QueuePop(_In_ PPAGE_QUEUE Queue)
+{
+	PPAGE Page = NULL;
+
+	AcquireSRWLockExclusive(&Queue->Lock);
+
+	if (!Queue->Head)
+		goto unlock;
+
+	Page = Queue->Head;
+	Queue->Head = Page->QueueNext;
+
+	if (!Queue->Head)
+		Queue->Tail = NULL;
+
+unlock:
+	ReleaseSRWLockExclusive(&Queue->Lock);
+	return Page;
+}
+
+STATIC
+VOID QueuePush(_In_ PPAGE_QUEUE Queue, _In_ PPAGE Page)
+{
+	AcquireSRWLockExclusive(&Queue->Lock);
+
+	Page->QueueNext = NULL;
+
+	if (!Queue->Tail) {
+		Queue->Head = Page;
+		Queue->Tail = Page;
+		goto unlock_and_signal;
+	}
+
+	Queue->Tail->QueueNext = Page;
+	Queue->Tail = Page;
+
+unlock_and_signal:
+	ReleaseSRWLockExclusive(&Queue->Lock);
+	/* Wake single thread */
+	WakeConditionVariable(&Queue->CondVar);
+}
+
+STATIC
+VOID QueueInit(_Out_ PPAGE_QUEUE Queue)
+{
+	Queue->Head = NULL;
+	Queue->Tail = NULL;
+	InitializeSRWLock(&Queue->Lock);
+	InitializeConditionVariable(&Queue->CondVar);
+}
 
 #define HASH_SET_DEFAULT_BUCKET_COUNT 512
 
