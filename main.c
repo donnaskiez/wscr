@@ -17,9 +17,10 @@ __declspec(thread) ARENA_CONTEXT ArenaContext = { 0 };
 
 #define PAGE_SIZE 4096
 #define STATIC static
+#define DEFAULT_ARENA_ALLOC_SIZE 16 * 1024 * 1024
 
 STATIC
-VOID ArenaDestroy()
+VOID ArenaDeInit()
 {
 	if (ArenaContext.Base)
 		VirtualFree(ArenaContext.Base, 0, MEM_RELEASE);
@@ -83,6 +84,9 @@ typedef struct _PAGE_QUEUE {
 	SRWLOCK Lock;
 	CONDITION_VARIABLE CondVar;
 
+	/* No more items will be added */
+	BOOL Terminate;
+
 } PAGE_QUEUE, *PPAGE_QUEUE;
 
 STATIC
@@ -92,8 +96,8 @@ PPAGE QueuePop(_In_ PPAGE_QUEUE Queue)
 
 	AcquireSRWLockExclusive(&Queue->Lock);
 
-	if (!Queue->Head)
-		goto unlock;
+	while (!Queue->Head && !Queue->Terminate)
+		SleepConditionVariableSRW(&Queue->CondVar, &Queue->Lock, INFINITE, 0);
 
 	Page = Queue->Head;
 	Queue->Head = Page->QueueNext;
@@ -101,7 +105,6 @@ PPAGE QueuePop(_In_ PPAGE_QUEUE Queue)
 	if (!Queue->Head)
 		Queue->Tail = NULL;
 
-unlock:
 	ReleaseSRWLockExclusive(&Queue->Lock);
 	return Page;
 }
@@ -129,10 +132,20 @@ unlock_and_signal:
 }
 
 STATIC
+VOID QueueDeInit(_Out_ PPAGE_QUEUE Queue)
+{
+	AcquireSRWLockExclusive(&Queue->Lock);
+	Queue->Terminate = TRUE;
+	WakeAllConditionVariable(&Queue->CondVar);
+	WakeConditionVariable(&Queue->CondVar);
+}
+
+STATIC
 VOID QueueInit(_Out_ PPAGE_QUEUE Queue)
 {
 	Queue->Head = NULL;
 	Queue->Tail = NULL;
+	Queue->Terminate = FALSE;
 	InitializeSRWLock(&Queue->Lock);
 	InitializeConditionVariable(&Queue->CondVar);
 }
@@ -227,9 +240,6 @@ HashSetInit(_Out_ PHASH_SET Set)
 typedef struct _THREAD_POOL {
 	PHANDLE ThreadHandles;
 	DWORD ThreadCount;
-
-	/* Tell thread to terminate */
-	BOOL Terminate;
 } THREAD_POOL, *PTHREAD_POOL;
 
 typedef struct _SESSION_CONTEXT {
@@ -242,73 +252,9 @@ typedef struct _SESSION_CONTEXT {
 
 	HASH_SET Set;
 	THREAD_POOL Pool;
+	PAGE_QUEUE Queue;
 
 } SESSION_CONTEXT, *PSESSION_CONTEXT;
-
-STATIC
-VOID ThreadPoolDeInit(_In_ PTHREAD_POOL Tp)
-{
-	UINT32 Idx;
-
-	if (!Tp->ThreadCount)
-		return;
-
-	Tp->Terminate = TRUE;
-	WaitForMultipleObjects(Tp->ThreadCount, Tp->ThreadHandles, TRUE, INFINITE);
-
-	for (Idx = 0; Idx < Tp->ThreadCount; Idx++)
-		CloseHandle(Tp->ThreadHandles[Idx]);
-}
-
-DWORD WINAPI ThreadPoolWorker(_In_ LPVOID Parameter)
-{
-	PSESSION_CONTEXT Ctx = (PSESSION_CONTEXT)Parameter;
-
-	printf("Executing pool worker thread. TID: %d\n", GetCurrentThreadId());
-
-	while (!Ctx->Pool.Terminate)
-		;
-
-	printf("Terminating worker thread. TIP: %d\n", GetCurrentThreadId());
-	return ERROR_SUCCESS;
-}
-
-#define THREAD_POOL_WORKER_COUNT 16
-
-STATIC
-UINT32
-ThreadPoolInit(_In_ PSESSION_CONTEXT Ctx, _Out_ PTHREAD_POOL Tp)
-{
-	UINT32 Idx;
-
-	Tp->Terminate = FALSE;
-	Tp->ThreadCount = THREAD_POOL_WORKER_COUNT;
-	Tp->ThreadHandles =
-			ArenaAlloc(Tp->ThreadCount * sizeof(*Tp->ThreadHandles));
-	if (!Tp->ThreadHandles)
-		return ERROR_NOT_ENOUGH_MEMORY;
-
-	for (Idx = 0; Idx < Tp->ThreadCount; Idx++) {
-		Tp->ThreadHandles[Idx] =
-				CreateThread(NULL, 0, ThreadPoolWorker, Ctx, 0, NULL);
-		if (!Tp->ThreadHandles[Idx]) {
-			/*
-			 * Set the threadcount to the number of threads that were
-			 * successfully created so when ThreadPoolDeInit is called
-			 * we only wait on the number of handles that were
-			 * created.
-			 */
-			Tp->ThreadCount = Idx;
-			goto error;
-		}
-	}
-
-	return ERROR_SUCCESS;
-
-error:
-	ThreadPoolDeInit(Tp);
-	return ERROR_TOO_MANY_THREADS;
-}
 
 /*
  * Rather then reformatting the string, find the fragment '#' and
@@ -358,14 +304,14 @@ UrlDownload(_In_ PSESSION_CONTEXT Ctx, _In_ LPURL_COMPONENTSA Url,
 	*RequestHandle = HttpOpenRequestA(Ctx->ConnectionHandle, "GET", Object,
 									  NULL, NULL, NULL, Flags, NULL);
 	if (!*RequestHandle) {
-		printf("Failed to open HttpRequest handle: %d", GetLastError());
+		printf("Failed to open HttpRequest handle: %d\n", GetLastError());
 		return ERROR_BAD_ARGUMENTS;
 	}
 
 	Ret = HttpSendRequestA(*RequestHandle, NULL, 0, NULL, 0);
 	if (!Ret) {
 		Status = GetLastError();
-		printf("Failed to send HttpRequest: %u", Status);
+		printf("Failed to send HttpRequest: %u\n", Status);
 		goto request_fail;
 	}
 
@@ -373,7 +319,7 @@ UrlDownload(_In_ PSESSION_CONTEXT Ctx, _In_ LPURL_COMPONENTSA Url,
 						 HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER,
 						 StatusCode, &BufLength, NULL);
 	if (!Ret) {
-		printf("Failied to query status code: %d", GetLastError());
+		printf("Failied to query status code: %d\n", GetLastError());
 		Status = ERROR_ACCESS_DENIED;
 		goto request_fail;
 	}
@@ -381,7 +327,7 @@ UrlDownload(_In_ PSESSION_CONTEXT Ctx, _In_ LPURL_COMPONENTSA Url,
 	/* Redirects are handed back so the Location goes through the link path */
 	if (*StatusCode != HTTP_STATUS_OK &&
 		!HTTP_STATUS_IS_REDIRECT(*StatusCode)) {
-		printf("HTTPS Query Failed. Status: %d", *StatusCode);
+		printf("HTTPS Query Failed. Status: %d\n", *StatusCode);
 		Status = ERROR_ACCESS_DENIED;
 		goto request_fail;
 	}
@@ -583,7 +529,7 @@ VOID PageChildrenAddEntry(_In_ PSESSION_CONTEXT Ctx, _In_ LPCSTR PageUrl,
 	if (HashSetAddOrContains(&Ctx->Set, ChildPage) == HASH_SET_PAGE_EXIST)
 		return;
 
-	printf("Adding new page to queue!\n");
+	QueuePush(&Ctx->Queue, ChildPage);
 }
 
 STATIC
@@ -644,7 +590,7 @@ UINT32 PageChildrenParse(_In_ PSESSION_CONTEXT Ctx, _In_ HINTERNET Request,
 
 		if (!InternetReadFile(Request, Page + Length,
 							  (DWORD)(Capacity - Length - 1), &BytesRead)) {
-			printf("Failed to read page. %d", GetLastError());
+			printf("Failed to read page. %d\n", GetLastError());
 			return ERROR_ACCESS_DENIED;
 		}
 
@@ -655,6 +601,111 @@ UINT32 PageChildrenParse(_In_ PSESSION_CONTEXT Ctx, _In_ HINTERNET Request,
 	PageChildrenEnumerate(Ctx, PageUrl, Page);
 
 	return ERROR_SUCCESS;
+}
+
+STATIC
+VOID ThreadPoolDeInit(_In_ PTHREAD_POOL Tp)
+{
+	UINT32 Idx;
+
+	if (!Tp->ThreadCount)
+		return;
+
+	WaitForMultipleObjects(Tp->ThreadCount, Tp->ThreadHandles, TRUE, INFINITE);
+
+	for (Idx = 0; Idx < Tp->ThreadCount; Idx++)
+		CloseHandle(Tp->ThreadHandles[Idx]);
+}
+
+STATIC
+UINT32
+ThreadPoolWorkerHandlePage(_In_ PSESSION_CONTEXT Ctx, _In_ PPAGE Page)
+{
+	HINTERNET Request = NULL;
+	DWORD StatusCode = 0;
+	UINT32 Ret;
+
+	Ret = UrlDownload(Ctx, &Page->Components, &Request, &StatusCode);
+	if (Ret) {
+		printf("Failed to download URL: %d\n", Ret);
+		return Ret;
+	}
+
+	Ret = PageChildrenParse(&Ctx, Request, Page->AbsoluteUrl);
+	if (Ret) {
+		printf("Failed to parse page childen: %d\n", Ret);
+		goto page_parse_fail;
+	}
+
+page_parse_fail:
+	InternetCloseHandle(Request);
+	return Ret;
+}
+
+DWORD WINAPI ThreadPoolWorker(_In_ LPVOID Parameter)
+{
+	PSESSION_CONTEXT Ctx = (PSESSION_CONTEXT)Parameter;
+	PPAGE Page;
+	UINT32 Ret;
+
+	printf("Executing pool worker thread. TID: %d\n", GetCurrentThreadId());
+
+	Ret = ArenaInit(DEFAULT_ARENA_ALLOC_SIZE);
+	if (Ret) {
+		printf("Failed to initialise allocator on TID: %d\n",
+			   GetCurrentThreadId());
+		return Ret;
+	}
+
+	while ((Page = QueuePop(&Ctx->Queue))) {
+		printf("TID: %d: Page: %s\n", GetCurrentThreadId(), Page->AbsoluteUrl);
+		Ret = ThreadPoolWorkerHandlePage(Ctx, Page);
+		if (Ret) {
+			printf("ThreadPool: Failed to handle page. TID: %d\n",
+				   GetCurrentThreadId());
+			continue;
+		}
+	}
+
+	printf("Terminating worker thread. TIP: %d\n", GetCurrentThreadId());
+	ArenaDeInit();
+	return ERROR_SUCCESS;
+}
+
+#define THREAD_POOL_WORKER_COUNT 16
+
+STATIC
+UINT32
+ThreadPoolInit(_In_ PSESSION_CONTEXT Ctx, _Out_ PTHREAD_POOL Tp)
+{
+	UINT32 Idx;
+
+	Tp->ThreadCount = THREAD_POOL_WORKER_COUNT;
+	Tp->ThreadHandles =
+			ArenaAlloc(Tp->ThreadCount * sizeof(*Tp->ThreadHandles));
+	if (!Tp->ThreadHandles)
+		return ERROR_NOT_ENOUGH_MEMORY;
+
+	for (Idx = 0; Idx < Tp->ThreadCount; Idx++) {
+		Tp->ThreadHandles[Idx] =
+				CreateThread(NULL, 0, ThreadPoolWorker, Ctx, 0, NULL);
+		if (!Tp->ThreadHandles[Idx]) {
+			/*
+			 * Set the threadcount to the number of threads that were
+			 * successfully created so when ThreadPoolDeInit is called
+			 * we only wait on the number of handles that were
+			 * created.
+			 */
+			Tp->ThreadCount = Idx;
+			goto error;
+		}
+	}
+
+	return ERROR_SUCCESS;
+
+error:
+	ThreadPoolDeInit(Tp);
+	return ERROR_TOO_MANY_THREADS;
 }
 
 /*
@@ -670,40 +721,42 @@ Scrape(_In_ LPCSTR Url)
 	DWORD StatusCode;
 	UINT32 Ret;
 
-	Ret = ArenaInit(16 * 1024 * 1024);
+	Ret = ArenaInit(DEFAULT_ARENA_ALLOC_SIZE);
 	if (Ret) {
-		printf("Failed to initialise base allocator");
+		printf("Failed to initialise base allocator\n");
 		return Ret;
 	}
 
 	Ret = HashSetInit(&Ctx.Set);
 	if (Ret) {
-		printf("Failed to initialise HashSet");
+		printf("Failed to initialise HashSet\n");
 		goto hash_set_fail;
 	}
 
 	Ret = SessionInit(&Ctx, Url);
 	if (Ret) {
-		printf("Failed to initialise session: %d", Ret);
+		printf("Failed to initialise session: %d\n", Ret);
 		goto session_init_fail;
 	}
+
+	QueueInit(&Ctx.Queue);
 
 	/* Workers use the session, so they start after it and stop before it */
 	Ret = ThreadPoolInit(&Ctx, &Ctx.Pool);
 	if (Ret) {
-		printf("Failed to initialise threadpool: %d", Ret);
+		printf("Failed to initialise threadpool: %d\n", Ret);
 		goto thread_pool_fail;
 	}
 
 	Ret = UrlDownload(&Ctx, &Ctx.BaseUrl.Components, &Request, &StatusCode);
 	if (Ret) {
-		printf("Failed to download URL: %d", Ret);
+		printf("Failed to download URL: %d\n", Ret);
 		goto url_dl_fail;
 	}
 
 	Ret = PageChildrenParse(&Ctx, Request, Url);
 	if (Ret) {
-		printf("Failed to parse page childen: %d", Ret);
+		printf("Failed to parse page childen: %d\n", Ret);
 		goto page_parse_fail;
 	}
 
@@ -712,10 +765,11 @@ page_parse_fail:
 url_dl_fail:
 	ThreadPoolDeInit(&Ctx.Pool);
 thread_pool_fail:
+	QueueDeInit(&Ctx.Queue);
 session_init_fail:
 	SessionDeInit(&Ctx);
 hash_set_fail:
-	ArenaDestroy();
+	ArenaDeInit();
 	return Ret;
 }
 
