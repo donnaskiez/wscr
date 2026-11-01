@@ -68,6 +68,92 @@ ArenaInit(SIZE_T Size)
 	return ERROR_SUCCESS;
 }
 
+typedef struct _PAGE {
+	struct _PAGE *Next;
+	URL_COMPONENTSA Components;
+	PCHAR AbsoluteUrl;
+	DWORD AbsoluteUrlLength;
+	UINT64 AbsoluteUrlHash;
+} PAGE, *PPAGE;
+
+//typedef struct _PAGE_QUEUE {
+//
+//}PAGE_QUEUE, *PPAGE_QUEUE;
+
+#define HASH_SET_DEFAULT_BUCKET_COUNT 64
+
+typedef struct _HASH_SET {
+	PPAGE *BucketArray;
+	UINT32 BucketCount;
+} HASH_SET, *PHASH_SET;
+
+#define FNV_HASH_OFFSET_BASIS 0xcbf29ce484222325
+#define FNV_HASH_PRIME 0x00000100000001b3
+
+STATIC
+UINT64
+HashSetHash(_In_ PPAGE Page)
+{
+	UINT64 Hash = FNV_HASH_OFFSET_BASIS;
+	UINT32 Idx;
+
+	for (Idx = 0; Idx < Page->AbsoluteUrlLength; Idx++) {
+		Hash *= FNV_HASH_PRIME;
+		Hash ^= (UCHAR)Page->AbsoluteUrl[Idx];
+	}
+
+	return Hash;
+}
+
+STATIC
+BOOL HashSetPageEquivalent(_In_ PPAGE Page1, _In_ PPAGE Page2)
+{
+	if (Page1->AbsoluteUrlHash != Page2->AbsoluteUrlHash)
+		return FALSE;
+	if (Page1->AbsoluteUrlLength != Page2->AbsoluteUrlLength)
+		return FALSE;
+	if (RtlCompareMemory(Page1->AbsoluteUrl, Page2->AbsoluteUrl,
+						 Page1->AbsoluteUrlLength) != Page1->AbsoluteUrlLength)
+		return FALSE;
+	return TRUE;
+}
+
+#define HASH_SET_PAGE_ADDED 0
+#define HASH_SET_PAGE_EXIST 1
+
+STATIC
+UINT32
+HashSetAddOrContains(_In_ PHASH_SET Set, _In_ PPAGE Page)
+{
+	UINT32 BucketIdx;
+	PPAGE Cur;
+
+	Page->AbsoluteUrlHash = HashSetHash(Page);
+	BucketIdx = (UINT32)(Page->AbsoluteUrlHash & (Set->BucketCount - 1));
+
+	for (Cur = Set->BucketArray[BucketIdx]; Cur; Cur = Cur->Next) {
+		if (HashSetPageEquivalent(Cur, Page))
+			return HASH_SET_PAGE_EXIST;
+	}
+
+	Page->Next = Set->BucketArray[BucketIdx];
+	Set->BucketArray[BucketIdx] = Page;
+	return HASH_SET_PAGE_ADDED;
+}
+
+STATIC
+UINT32
+HashSetInit(_Out_ PHASH_SET Set)
+{
+	Set->BucketArray =
+			ArenaAlloc(HASH_SET_DEFAULT_BUCKET_COUNT * sizeof(PPAGE));
+	if (!Set->BucketArray)
+		return ERROR_NOT_ENOUGH_MEMORY;
+
+	Set->BucketCount = HASH_SET_DEFAULT_BUCKET_COUNT;
+	return ERROR_SUCCESS;
+}
+
 typedef struct _SESSION_CONTEXT {
 	HINTERNET SessionHandle;
 	HINTERNET ConnectionHandle;
@@ -76,6 +162,8 @@ typedef struct _SESSION_CONTEXT {
 		URL_COMPONENTSA Components;
 		HINTERNET RequestHandle;
 	} BaseUrl;
+
+	HASH_SET Set;
 
 } SESSION_CONTEXT, *PSESSION_CONTEXT;
 
@@ -256,12 +344,6 @@ VOID UrlStripFragment(_Inout_ PCHAR Url)
 		*Fragment = '\0';
 }
 
-typedef struct _PAGE {
-	URL_COMPONENTSA Components;
-	PCHAR AbsoluteUrl;
-	DWORD AbsoluteUrlLength;
-} PAGE, *PPAGE;
-
 STATIC
 PPAGE
 PageChildrenParseEntry(_In_ PSESSION_CONTEXT Ctx, _In_ PVOID Base,
@@ -292,6 +374,8 @@ PageChildrenParseEntry(_In_ PSESSION_CONTEXT Ctx, _In_ PVOID Base,
 
 	UrlStripFragment(Url);
 
+	/* TODO: lower case scheme + hostname */
+
 	Ret = UrlParse(Url, &Page->Components);
 	if (Ret != ERROR_SUCCESS) {
 		printf("Failed to parse URL: %u\n", Ret);
@@ -314,6 +398,7 @@ VOID PageChildrenEnumerate(_In_ PSESSION_CONTEXT Ctx, _In_ PVOID Page)
 	PCHAR PageIndex = (PCHAR)Page;
 	PCHAR String = "a href=\"";
 	PPAGE ChildPage;
+	UINT8 Ret;
 
 	while (TRUE) {
 		PCHAR Href = StrStrA(PageIndex, String);
@@ -336,10 +421,14 @@ VOID PageChildrenEnumerate(_In_ PSESSION_CONTEXT Ctx, _In_ PVOID Page)
 
 		ChildPage = PageChildrenParseEntry(Ctx, Href, UrlLen);
 		if (ChildPage) {
-			printf("AbsoluteURL: %s\n", ChildPage->AbsoluteUrl);
-			printf("AbsoluteURL Length: %d\n", ChildPage->AbsoluteUrlLength);
+			Ret = HashSetAddOrContains(&Ctx->Set, ChildPage);
+			if (Ret == HASH_SET_PAGE_EXIST)
+				goto increment;
+
+			printf("Adding new page to queue!\n");
 		}
 
+increment:
 		PageIndex += ((Href - PageIndex) + UrlLen);
 	}
 }
@@ -400,28 +489,34 @@ Scrape(_In_ LPCSTR Url)
 		return Ret;
 	}
 
+	Ret = HashSetInit(&Ctx.Set);
+	if (Ret) {
+		printf("Failed to initialise HashSet");
+		goto end;
+	}
+
 	Ret = SessionInit(&Ctx, Url);
 	if (Ret) {
 		printf("Failed to initialise session: %d", Ret);
-		return Ret;
+		goto end;
 	}
 
 	Ret = UrlDownload(&Ctx, &Ctx.BaseUrl.Components,
 					  &Ctx.BaseUrl.RequestHandle);
 	if (Ret) {
 		printf("Failed to download URL: %d", Ret);
-		return Ret;
+		goto end;
 	}
 
 	Ret = PageChildrenParse(&Ctx, Ctx.BaseUrl.RequestHandle,
 							&Ctx.BaseUrl.Components);
 	if (Ret) {
 		printf("Failed to parse page childen: %d", Ret);
-		return Ret;
+		goto end;
 	}
 
+end:
 	ArenaDestroy();
-
 	return Ret;
 }
 
