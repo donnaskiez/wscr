@@ -170,6 +170,9 @@ HashSetInit(_Out_ PHASH_SET Set)
 typedef struct _THREAD_POOL {
 	PHANDLE ThreadHandles;
 	DWORD ThreadCount;
+
+	/* Tell thread to terminate */
+	BOOL Terminate;
 } THREAD_POOL, *PTHREAD_POOL;
 
 typedef struct _SESSION_CONTEXT {
@@ -190,10 +193,14 @@ VOID ThreadPoolDeInit(_In_ PTHREAD_POOL Tp)
 {
 	UINT32 Idx;
 
-	for (Idx = 0; Idx < Tp->ThreadCount; Idx++) {
-		if (Tp->ThreadHandles[Idx])
-			CloseHandle(Tp->ThreadHandles[Idx]);
-	}
+	if (!Tp->ThreadCount)
+		return;
+
+	Tp->Terminate = TRUE;
+	WaitForMultipleObjects(Tp->ThreadCount, Tp->ThreadHandles, TRUE, INFINITE);
+
+	for (Idx = 0; Idx < Tp->ThreadCount; Idx++)
+		CloseHandle(Tp->ThreadHandles[Idx]);
 }
 
 DWORD WINAPI ThreadPoolWorker(_In_ LPVOID Parameter)
@@ -202,8 +209,14 @@ DWORD WINAPI ThreadPoolWorker(_In_ LPVOID Parameter)
 
 	printf("Executing pool worker thread. TID: %d\n", GetCurrentThreadId());
 
+	while (!Ctx->Pool.Terminate)
+		;
+
+	printf("Terminating worker thread. TIP: %d\n", GetCurrentThreadId());
 	return ERROR_SUCCESS;
 }
+
+#define THREAD_POOL_WORKER_COUNT 16
 
 STATIC
 UINT32
@@ -211,7 +224,8 @@ ThreadPoolInit(_In_ PSESSION_CONTEXT Ctx, _Out_ PTHREAD_POOL Tp)
 {
 	UINT32 Idx;
 
-	Tp->ThreadCount = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+	Tp->Terminate = FALSE;
+	Tp->ThreadCount = THREAD_POOL_WORKER_COUNT;
 	Tp->ThreadHandles =
 			ArenaAlloc(Tp->ThreadCount * sizeof(*Tp->ThreadHandles));
 	if (!Tp->ThreadHandles)
@@ -220,8 +234,16 @@ ThreadPoolInit(_In_ PSESSION_CONTEXT Ctx, _Out_ PTHREAD_POOL Tp)
 	for (Idx = 0; Idx < Tp->ThreadCount; Idx++) {
 		Tp->ThreadHandles[Idx] =
 				CreateThread(NULL, 0, ThreadPoolWorker, Ctx, 0, NULL);
-		if (!Tp->ThreadHandles[Idx])
+		if (!Tp->ThreadHandles[Idx]) {
+			/*
+			 * Set the threadcount to the number of threads that were
+			 * successfully created so when ThreadPoolDeInit is called
+			 * we only wait on the number of handles that were
+			 * created.
+			 */
+			Tp->ThreadCount = Idx;
 			goto error;
+		}
 	}
 
 	return ERROR_SUCCESS;
@@ -603,16 +625,17 @@ Scrape(_In_ LPCSTR Url)
 		goto hash_set_fail;
 	}
 
-	Ret = ThreadPoolInit(&Ctx, &Ctx.Pool);
-	if (Ret) {
-		printf("Failed to initialise threadpool: %d", Ret);
-		goto thread_pool_fail;
-	}
-
 	Ret = SessionInit(&Ctx, Url);
 	if (Ret) {
 		printf("Failed to initialise session: %d", Ret);
 		goto session_init_fail;
+	}
+
+	/* Workers use the session, so they start after it and stop before it */
+	Ret = ThreadPoolInit(&Ctx, &Ctx.Pool);
+	if (Ret) {
+		printf("Failed to initialise threadpool: %d", Ret);
+		goto thread_pool_fail;
 	}
 
 	Ret = UrlDownload(&Ctx, &Ctx.BaseUrl.Components, &Request, &StatusCode);
@@ -630,10 +653,10 @@ Scrape(_In_ LPCSTR Url)
 page_parse_fail:
 	InternetCloseHandle(Request);
 url_dl_fail:
-session_init_fail:
 	ThreadPoolDeInit(&Ctx.Pool);
-	SessionDeInit(&Ctx);
 thread_pool_fail:
+session_init_fail:
+	SessionDeInit(&Ctx);
 hash_set_fail:
 	ArenaDestroy();
 	return Ret;
