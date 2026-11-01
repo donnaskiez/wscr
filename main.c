@@ -80,7 +80,7 @@ typedef struct _PAGE {
 //
 //}PAGE_QUEUE, *PPAGE_QUEUE;
 
-#define HASH_SET_DEFAULT_BUCKET_COUNT 64
+#define HASH_SET_DEFAULT_BUCKET_COUNT 512
 
 typedef struct _HASH_SET {
 	PPAGE *BucketArray;
@@ -160,7 +160,6 @@ typedef struct _SESSION_CONTEXT {
 
 	struct {
 		URL_COMPONENTSA Components;
-		HINTERNET RequestHandle;
 	} BaseUrl;
 
 	HASH_SET Set;
@@ -172,10 +171,11 @@ UINT32
 UrlDownload(_In_ PSESSION_CONTEXT Ctx, _In_ LPURL_COMPONENTSA Url,
 			_Out_ LPHINTERNET RequestHandle)
 {
+	DWORD Flags = INTERNET_FLAG_NO_CACHE_WRITE;
 	DWORD BufLength = sizeof(DWORD);
 	DWORD ContentLength = 0;
 	DWORD StatusCode = 0;
-	DWORD Flags = 0;
+	UINT32 Status;
 	BOOL Ret;
 
 	if (Url->nScheme == INTERNET_SCHEME_HTTPS)
@@ -189,22 +189,34 @@ UrlDownload(_In_ PSESSION_CONTEXT Ctx, _In_ LPURL_COMPONENTSA Url,
 		return ERROR_BAD_ARGUMENTS;
 	}
 
-	HttpSendRequestA(*RequestHandle, NULL, 0, NULL, 0);
+	Ret = HttpSendRequestA(*RequestHandle, NULL, 0, NULL, 0);
+	if (!Ret) {
+		Status = GetLastError();
+		printf("Failed to send HttpRequest: %u", Status);
+		goto request_fail;
+	}
 
 	Ret = HttpQueryInfoA(*RequestHandle,
 						 HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER,
 						 &StatusCode, &BufLength, NULL);
 	if (!Ret) {
 		printf("Failied to query status code: %d", GetLastError());
-		return ERROR_ACCESS_DENIED;
+		Status = ERROR_ACCESS_DENIED;
+		goto request_fail;
 	}
 
 	if (StatusCode != HTTP_STATUS_OK) {
 		printf("HTTPS Query Failed. Status: %d", StatusCode);
-		return ERROR_ACCESS_DENIED;
+		Status = ERROR_ACCESS_DENIED;
+		goto request_fail;
 	}
 
 	return ERROR_SUCCESS;
+
+request_fail:
+	InternetCloseHandle(*RequestHandle);
+	*RequestHandle = NULL;
+	return Status;
 }
 
 STATIC
@@ -266,6 +278,15 @@ UrlParse(_In_ LPCSTR Url, _Out_ LPURL_COMPONENTSA Components)
 	}
 
 	return ERROR_SUCCESS;
+}
+
+STATIC
+VOID SessionDeInit(_In_ PSESSION_CONTEXT Ctx)
+{
+	if (Ctx->ConnectionHandle)
+		InternetCloseHandle(Ctx->ConnectionHandle);
+	if (Ctx->SessionHandle)
+		InternetCloseHandle(Ctx->SessionHandle);
 }
 
 STATIC
@@ -481,6 +502,7 @@ UINT32
 Scrape(_In_ LPCSTR Url)
 {
 	SESSION_CONTEXT Ctx = { 0 };
+	HINTERNET Request = NULL;
 	UINT32 Ret;
 
 	Ret = ArenaInit(16 * 1024 * 1024);
@@ -492,30 +514,33 @@ Scrape(_In_ LPCSTR Url)
 	Ret = HashSetInit(&Ctx.Set);
 	if (Ret) {
 		printf("Failed to initialise HashSet");
-		goto end;
+		goto hash_set_fail;
 	}
 
 	Ret = SessionInit(&Ctx, Url);
 	if (Ret) {
 		printf("Failed to initialise session: %d", Ret);
-		goto end;
+		goto session_init_fail;
 	}
 
-	Ret = UrlDownload(&Ctx, &Ctx.BaseUrl.Components,
-					  &Ctx.BaseUrl.RequestHandle);
+	Ret = UrlDownload(&Ctx, &Ctx.BaseUrl.Components, &Request);
 	if (Ret) {
 		printf("Failed to download URL: %d", Ret);
-		goto end;
+		goto url_dl_fail;
 	}
 
-	Ret = PageChildrenParse(&Ctx, Ctx.BaseUrl.RequestHandle,
-							&Ctx.BaseUrl.Components);
+	Ret = PageChildrenParse(&Ctx, Request, &Ctx.BaseUrl.Components);
 	if (Ret) {
 		printf("Failed to parse page childen: %d", Ret);
-		goto end;
+		goto page_parse_fail;
 	}
 
-end:
+page_parse_fail:
+	InternetCloseHandle(Request);
+url_dl_fail:
+session_init_fail:
+	SessionDeInit(&Ctx);
+hash_set_fail:
 	ArenaDestroy();
 	return Ret;
 }
