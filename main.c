@@ -19,6 +19,7 @@ __declspec(thread) ARENA_CONTEXT ArenaContext = { 0 };
 #define PAGE_SIZE 4096
 #define STATIC static
 #define DEFAULT_ARENA_ALLOC_SIZE 16 * 1024 * 1024
+#define USER_AGENT_NAME "wscr"
 
 STATIC
 VOID Log(_In_z_ _Printf_format_string_ LPCSTR Format, ...)
@@ -293,6 +294,12 @@ typedef struct _THREAD_POOL {
 	DWORD ThreadCount;
 } THREAD_POOL, *PTHREAD_POOL;
 
+typedef struct _ROBOTS_RULE {
+	BOOL Allow;
+	PCHAR Pattern;
+	DWORD Length;
+} ROBOTS_RULE, *PROBOTS_RULE;
+
 typedef struct _SESSION_CONTEXT {
 	HINTERNET SessionHandle;
 	HINTERNET ConnectionHandle;
@@ -303,6 +310,10 @@ typedef struct _SESSION_CONTEXT {
 	HASH_SET Set;
 	THREAD_POOL Pool;
 	PAGE_QUEUE Queue;
+
+	/* robots.txt rules */
+	PROBOTS_RULE Rules;
+	DWORD RuleCount;
 
 } SESSION_CONTEXT, *PSESSION_CONTEXT;
 
@@ -471,8 +482,8 @@ SessionInit(_Out_ PSESSION_CONTEXT Ctx)
 	InternetSetOptionA(NULL, INTERNET_OPTION_MAX_CONNS_PER_SERVER, &MaxConns,
 					   sizeof(MaxConns));
 
-	Ctx->SessionHandle = InternetOpenA("WinInet", INTERNET_OPEN_TYPE_PRECONFIG,
-									   NULL, NULL, 0);
+	Ctx->SessionHandle = InternetOpenA(
+			USER_AGENT_NAME, INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
 	if (!Ctx->SessionHandle) {
 		Log("Failed to open SessionHandle: %d", GetLastError());
 		return GetLastError();
@@ -531,6 +542,21 @@ PPAGE PageCreate(_Inout_ PCHAR Url)
 	Page->AbsoluteUrl = Url;
 	Page->AbsoluteUrlLength = (DWORD)strlen(Url);
 	return Page;
+}
+
+#define ROBOTS_TXT_STRING "robots.txt"
+
+/*
+ * https://www.rfc-editor.org/info/rfc9309/
+ * https://developers.google.com/crawling/docs/robots-txt/robots-txt-spec
+ */
+STATIC
+UINT32
+SessionParseRobotsTxt(_In_ PSESSION_CONTEXT Ctx, _In_ PPAGE Page)
+{
+	UINT32 Ret;
+
+	//Ret = UrlDownload(Ctx, &Page->Components, &Request, &StatusCode);
 }
 
 STATIC
