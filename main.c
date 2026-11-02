@@ -101,10 +101,35 @@ typedef struct _PAGE_QUEUE {
 	SRWLOCK Lock;
 	CONDITION_VARIABLE CondVar;
 
+	/*
+	 * Counts the number of outstanding pages to process.
+	 * Incremented on push, and only decremented once all
+	 * children of said page have been processed.
+	 */
+	UINT32 Outstanding;
+
 	/* No more items will be added */
 	BOOL Terminate;
 
 } PAGE_QUEUE, *PPAGE_QUEUE;
+
+STATIC
+VOID QueueCompleteTask(_In_ PPAGE_QUEUE Queue)
+{
+	BOOL Finished;
+
+	AcquireSRWLockExclusive(&Queue->Lock);
+	Queue->Outstanding--;
+
+	Finished = (Queue->Outstanding == 0);
+	if (Finished)
+		Queue->Terminate = TRUE;
+
+	ReleaseSRWLockExclusive(&Queue->Lock);
+
+	if (Finished)
+		WakeAllConditionVariable(&Queue->CondVar);
+}
 
 STATIC
 PPAGE QueuePop(_In_ PPAGE_QUEUE Queue)
@@ -136,6 +161,7 @@ VOID QueuePush(_In_ PPAGE_QUEUE Queue, _In_ PPAGE Page)
 	AcquireSRWLockExclusive(&Queue->Lock);
 
 	Page->QueueNext = NULL;
+	Queue->Outstanding++;
 
 	if (!Queue->Tail) {
 		Queue->Head = Page;
@@ -166,6 +192,7 @@ VOID QueueInit(_Out_ PPAGE_QUEUE Queue)
 {
 	Queue->Head = NULL;
 	Queue->Tail = NULL;
+	Queue->Outstanding = 0;
 	Queue->Terminate = FALSE;
 	InitializeSRWLock(&Queue->Lock);
 	InitializeConditionVariable(&Queue->CondVar);
@@ -267,9 +294,8 @@ typedef struct _SESSION_CONTEXT {
 	HINTERNET SessionHandle;
 	HINTERNET ConnectionHandle;
 
-	struct {
-		URL_COMPONENTSA Components;
-	} BaseUrl;
+	/* The page the crawl started from, its host is the crawl's scope */
+	PPAGE Seed;
 
 	HASH_SET Set;
 	THREAD_POOL Pool;
@@ -432,29 +458,12 @@ VOID SessionDeInit(_In_ PSESSION_CONTEXT Ctx)
 
 STATIC
 UINT32
-SessionInit(_Out_ PSESSION_CONTEXT Ctx, _In_ LPCSTR Url)
+SessionInit(_Out_ PSESSION_CONTEXT Ctx)
 {
-	UINT32 Ret;
-
-	Ret = UrlParse(Url, &Ctx->BaseUrl.Components);
-	if (Ret != ERROR_SUCCESS) {
-		Log("Failed to parse URL: %d", Ret);
-		return Ret;
-	}
-
 	Ctx->SessionHandle = InternetOpenA("WinInet", INTERNET_OPEN_TYPE_PRECONFIG,
 									   NULL, NULL, 0);
 	if (!Ctx->SessionHandle) {
 		Log("Failed to open SessionHandle: %d", GetLastError());
-		return GetLastError();
-	}
-
-	Ctx->ConnectionHandle = InternetConnectA(
-			Ctx->SessionHandle, Ctx->BaseUrl.Components.lpszHostName,
-			Ctx->BaseUrl.Components.nPort, NULL, NULL, INTERNET_SERVICE_HTTP, 0,
-			NULL);
-	if (!Ctx->ConnectionHandle) {
-		Log("Failed to open ConnectionHandle: %d", GetLastError());
 		return GetLastError();
 	}
 
@@ -489,17 +498,64 @@ UrlBuildAbsoluteFromRelative(_In_ LPCSTR PageUrl, _In_ LPCSTR Relative)
 }
 
 STATIC
-PPAGE
-PageChildrenParseEntry(_In_ PSESSION_CONTEXT Ctx, _In_ LPCSTR PageUrl,
-					   _In_ PVOID Base, _In_ DWORD Length)
+PPAGE PageCreate(_Inout_ PCHAR Url)
 {
 	UINT32 Ret;
 	PPAGE Page;
-	PCHAR Url;
 
 	Page = ArenaAlloc(sizeof(*Page));
 	if (!Page)
 		return NULL;
+
+	UrlStripFragment(Url);
+
+	/* TODO: lower case scheme + hostname */
+
+	Ret = UrlParse(Url, &Page->Components);
+	if (Ret != ERROR_SUCCESS) {
+		Log("Failed to parse URL: %u", Ret);
+		return NULL;
+	}
+
+	Page->AbsoluteUrl = Url;
+	Page->AbsoluteUrlLength = (DWORD)strlen(Url);
+	return Page;
+}
+
+STATIC
+UINT32
+SessionSeed(_Inout_ PSESSION_CONTEXT Ctx, _In_ LPSTR Url)
+{
+	PPAGE Seed;
+
+	Seed = PageCreate(Url);
+	if (!Seed) {
+		Log("Failed to create seed page");
+		return ERROR_BAD_ARGUMENTS;
+	}
+
+	Ctx->Seed = Seed;
+	Ctx->ConnectionHandle = InternetConnectA(Ctx->SessionHandle,
+											 Seed->Components.lpszHostName,
+											 Seed->Components.nPort, NULL, NULL,
+											 INTERNET_SERVICE_HTTP, 0, NULL);
+	if (!Ctx->ConnectionHandle) {
+		Log("Failed to open ConnectionHandle: %d", GetLastError());
+		return GetLastError();
+	}
+
+	HashSetAddOrContains(&Ctx->Set, Seed);
+	QueuePush(&Ctx->Queue, Seed);
+	return ERROR_SUCCESS;
+}
+
+STATIC
+PPAGE
+PageChildrenParseEntry(_In_ PSESSION_CONTEXT Ctx, _In_ LPCSTR PageUrl,
+					   _In_ PVOID Base, _In_ DWORD Length)
+{
+	PPAGE Page;
+	PCHAR Url;
 
 	Url = ArenaAlloc(Length + 1);
 	if (!Url)
@@ -516,23 +572,16 @@ PageChildrenParseEntry(_In_ PSESSION_CONTEXT Ctx, _In_ LPCSTR PageUrl,
 		}
 	}
 
-	UrlStripFragment(Url);
-
-	/* TODO: lower case scheme + hostname */
-
-	Ret = UrlParse(Url, &Page->Components);
-	if (Ret != ERROR_SUCCESS) {
-		Log("Failed to parse URL: %u", Ret);
-		return NULL;
-	}
-
-	/* Remove URLs that don't match our base hostname */
-	if (StrCmpA(Page->Components.lpszHostName,
-				Ctx->BaseUrl.Components.lpszHostName))
+	Page = PageCreate(Url);
+	if (!Page)
 		return NULL;
 
-	Page->AbsoluteUrl = Url;
-	Page->AbsoluteUrlLength = strlen(Url);
+	if (Page->Components.nScheme != Ctx->Seed->Components.nScheme ||
+		Page->Components.nPort != Ctx->Seed->Components.nPort ||
+		StrCmpA(Page->Components.lpszHostName,
+				Ctx->Seed->Components.lpszHostName))
+		return NULL;
+
 	return Page;
 }
 
@@ -624,14 +673,19 @@ UINT32 PageChildrenParse(_In_ PSESSION_CONTEXT Ctx, _In_ HINTERNET Request,
 }
 
 STATIC
-VOID ThreadPoolDeInit(_In_ PTHREAD_POOL Tp)
+VOID ThreadPoolWaitForAll(_In_ PTHREAD_POOL Tp)
 {
-	UINT32 Idx;
-
 	if (!Tp->ThreadCount)
 		return;
 
 	WaitForMultipleObjects(Tp->ThreadCount, Tp->ThreadHandles, TRUE, INFINITE);
+}
+
+/* ThreadPoolWaitForAll must be called first */
+STATIC
+VOID ThreadPoolDeInit(_In_ PTHREAD_POOL Tp)
+{
+	UINT32 Idx;
 
 	for (Idx = 0; Idx < Tp->ThreadCount; Idx++)
 		CloseHandle(Tp->ThreadHandles[Idx]);
@@ -679,15 +733,24 @@ DWORD WINAPI ThreadPoolWorker(_In_ LPVOID Parameter)
 	while ((Page = QueuePop(&Ctx->Queue))) {
 		Log("Page: %s", Page->AbsoluteUrl);
 		Ret = ThreadPoolWorkerHandlePage(Ctx, Page);
-		if (Ret) {
+		if (Ret)
 			Log("ThreadPool: Failed to handle page");
-			continue;
-		}
+
+		QueueCompleteTask(&Ctx->Queue);
 	}
 
 	Log("Terminating worker thread");
 	ArenaDeInit();
 	return ERROR_SUCCESS;
+}
+
+STATIC
+VOID ThreadPoolStart(_In_ PTHREAD_POOL Tp)
+{
+	UINT32 Idx;
+
+	for (Idx = 0; Idx < Tp->ThreadCount; Idx++)
+		ResumeThread(Tp->ThreadHandles[Idx]);
 }
 
 #define THREAD_POOL_WORKER_COUNT 16
@@ -705,8 +768,8 @@ ThreadPoolInit(_In_ PSESSION_CONTEXT Ctx, _Out_ PTHREAD_POOL Tp)
 		return ERROR_NOT_ENOUGH_MEMORY;
 
 	for (Idx = 0; Idx < Tp->ThreadCount; Idx++) {
-		Tp->ThreadHandles[Idx] =
-				CreateThread(NULL, 0, ThreadPoolWorker, Ctx, 0, NULL);
+		Tp->ThreadHandles[Idx] = CreateThread(NULL, 0, ThreadPoolWorker, Ctx,
+											  CREATE_SUSPENDED, NULL);
 		if (!Tp->ThreadHandles[Idx]) {
 			/*
 			 * Set the threadcount to the number of threads that were
@@ -722,7 +785,9 @@ ThreadPoolInit(_In_ PSESSION_CONTEXT Ctx, _Out_ PTHREAD_POOL Tp)
 	return ERROR_SUCCESS;
 
 error:
+	ThreadPoolStart(Tp);
 	QueueDeInit(&Ctx->Queue);
+	ThreadPoolWaitForAll(Tp);
 	ThreadPoolDeInit(Tp);
 	return ERROR_TOO_MANY_THREADS;
 }
@@ -733,11 +798,9 @@ error:
  */
 STATIC
 UINT32
-Scrape(_In_ LPCSTR Url)
+Scrape(_In_ LPSTR Url)
 {
 	SESSION_CONTEXT Ctx = { 0 };
-	HINTERNET Request = NULL;
-	DWORD StatusCode;
 	UINT32 Ret;
 
 	Ret = ArenaInit(DEFAULT_ARENA_ALLOC_SIZE);
@@ -752,7 +815,7 @@ Scrape(_In_ LPCSTR Url)
 		goto hash_set_fail;
 	}
 
-	Ret = SessionInit(&Ctx, Url);
+	Ret = SessionInit(&Ctx);
 	if (Ret) {
 		Log("Failed to initialise session: %d", Ret);
 		goto session_init_fail;
@@ -760,31 +823,33 @@ Scrape(_In_ LPCSTR Url)
 
 	QueueInit(&Ctx.Queue);
 
-	/* Workers use the session, so they start after it and stop before it */
 	Ret = ThreadPoolInit(&Ctx, &Ctx.Pool);
 	if (Ret) {
 		Log("Failed to initialise threadpool: %d", Ret);
 		goto thread_pool_fail;
 	}
 
-	Ret = UrlDownload(&Ctx, &Ctx.BaseUrl.Components, &Request, &StatusCode);
+	Ret = SessionSeed(&Ctx, Url);
 	if (Ret) {
-		Log("Failed to download URL: %d", Ret);
-		goto url_dl_fail;
+		Log("Failed to seed crawl: %d", Ret);
+		QueueDeInit(&Ctx.Queue);
+
+		/*
+		 * Even if we fail here, we need to resume each
+		 * suspended thread, wait for completion and then
+		 * close the handle to each, so fallthrough
+		 */
 	}
 
-	Ret = PageChildrenParse(&Ctx, Request, Url);
-	if (Ret) {
-		Log("Failed to parse page childen: %d", Ret);
-		goto page_parse_fail;
-	}
+	/* Start processing URLs in the queue */
+	ThreadPoolStart(&Ctx.Pool);
 
-page_parse_fail:
-	InternetCloseHandle(Request);
-url_dl_fail:
-	/* Close the queue first so sleeping workers wake up and exit */
-	QueueDeInit(&Ctx.Queue);
+	/* Wait for all threads to complete */
+	ThreadPoolWaitForAll(&Ctx.Pool);
+
+	/* Workers exit by themselves once Outstanding reaches 0 */
 	ThreadPoolDeInit(&Ctx.Pool);
+
 thread_pool_fail:
 session_init_fail:
 	SessionDeInit(&Ctx);
