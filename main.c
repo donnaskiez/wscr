@@ -212,6 +212,7 @@ typedef struct _HASH_SET {
 	SRWLOCK Lock;
 } HASH_SET, *PHASH_SET;
 
+/* https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function */
 #define FNV_HASH_OFFSET_BASIS 0xcbf29ce484222325
 #define FNV_HASH_PRIME 0x00000100000001b3
 
