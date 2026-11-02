@@ -311,9 +311,14 @@ typedef struct _SESSION_CONTEXT {
 	THREAD_POOL Pool;
 	PAGE_QUEUE Queue;
 
-	/* robots.txt rules */
-	PROBOTS_RULE Rules;
-	DWORD RuleCount;
+	struct {
+		/* Is there robot rules? */
+		BOOL Rules;
+
+		PROBOTS_RULE Rules;
+		DWORD RuleCount;
+		PAGE Page;
+	} Robots;
 
 } SESSION_CONTEXT, *PSESSION_CONTEXT;
 
@@ -336,8 +341,8 @@ VOID UrlStripFragment(_Inout_ PCHAR Url)
 
 STATIC
 UINT32
-UrlDownload(_In_ PSESSION_CONTEXT Ctx, _In_ LPURL_COMPONENTSA Url,
-			_Out_ LPHINTERNET RequestHandle, _Out_ PDWORD StatusCode)
+UrlRequestPage(_In_ PSESSION_CONTEXT Ctx, _In_ LPURL_COMPONENTSA Url,
+			   _Out_ LPHINTERNET RequestHandle, _Out_ PDWORD StatusCode)
 {
 	DWORD Flags = INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_NO_AUTO_REDIRECT;
 	SIZE_T PathLength = strlen(Url->lpszUrlPath);
@@ -519,6 +524,47 @@ UrlBuildAbsoluteFromRelative(_In_ LPCSTR PageUrl, _In_ LPCSTR Relative)
 	return Absolute;
 }
 
+#define PAGE_READ_CHUNK (64 * 1024)
+
+STATIC
+UINT32
+UrlDownload(_In_ PSESSION_CONTEXT Ctx, _In_ HINTERNET Request,
+			_Out_ PCHAR *Page, _Out_ PDWORD PageLength)
+{
+	SIZE_T Capacity = PAGE_READ_CHUNK;
+	SIZE_T Length = 0;
+	DWORD BytesRead;
+
+	*Page = NULL;
+	*PageLength = 0;
+
+	*Page = ArenaAlloc(Capacity);
+	if (!*Page)
+		return ERROR_NOT_ENOUGH_MEMORY;
+
+	/* The last byte is kept free for the NUL terminator */
+	do {
+		if (Capacity - Length == 1) {
+			if (ArenaAlloc(PAGE_READ_CHUNK) != *Page + Capacity)
+				return ERROR_NOT_ENOUGH_MEMORY;
+
+			Capacity += PAGE_READ_CHUNK;
+		}
+
+		if (!InternetReadFile(Request, *Page + Length,
+							  (DWORD)(Capacity - Length - 1), &BytesRead)) {
+			Log("Failed to read page. %d", GetLastError());
+			return ERROR_ACCESS_DENIED;
+		}
+
+		Length += BytesRead;
+	} while (BytesRead);
+
+	(*Page)[Length] = '\0';
+	*PageLength = Length;
+	return ERROR_SUCCESS;
+}
+
 STATIC
 PPAGE PageCreate(_Inout_ PCHAR Url)
 {
@@ -552,17 +598,127 @@ PPAGE PageCreate(_Inout_ PCHAR Url)
  */
 STATIC
 UINT32
-SessionParseRobotsTxt(_In_ PSESSION_CONTEXT Ctx, _In_ PPAGE Page)
+SessionDownloadRobotRules(_In_ PSESSION_CONTEXT Ctx, _In_ PPAGE Seed,
+						  _Out_ PCHAR *Page, _Out_ PDWORD PageLength)
 {
+	UINT32 RobotsUrlLength;
+	HINTERNET Request;
+	DWORD StatusCode;
+	PCHAR RobotsUrl;
+	PPAGE Robots;
 	UINT32 Ret;
+	BOOL AddSlash = FALSE;
 
-	//Ret = UrlDownload(Ctx, &Page->Components, &Request, &StatusCode);
+	*Page = NULL;
+	*PageLength = 0;
+
+	/* Handle seed URLs without a trailing "/" */
+	RobotsUrlLength = Seed->AbsoluteUrlLength + strlen(ROBOTS_TXT_STRING) + 1;
+	if (Seed->AbsoluteUrl[Seed->AbsoluteUrlLength - 1] != '/') {
+		RobotsUrlLength++;
+		AddSlash = TRUE;
+	}
+
+	RobotsUrl = ArenaAlloc(RobotsUrlLength);
+	if (!RobotsUrlLength)
+		return ERROR_NOT_ENOUGH_MEMORY;
+
+	RtlCopyMemory(RobotsUrl, Seed->AbsoluteUrl, Seed->AbsoluteUrlLength);
+
+	if (AddSlash) {
+		RtlCopyMemory(RobotsUrl + Seed->AbsoluteUrlLength, "/", 1);
+		RtlCopyMemory(RobotsUrl + Seed->AbsoluteUrlLength + 1,
+					  ROBOTS_TXT_STRING, strlen(ROBOTS_TXT_STRING));
+	} else {
+		RtlCopyMemory(RobotsUrl + Seed->AbsoluteUrlLength, ROBOTS_TXT_STRING,
+					  strlen(ROBOTS_TXT_STRING));
+	}
+
+	RobotsUrl[RobotsUrlLength] = '\0';
+
+	Robots = PageCreate(RobotsUrl);
+	if (!Robots)
+		return ERROR_NOT_ENOUGH_MEMORY;
+
+	Ret = UrlRequestPage(Ctx, &Robots->Components, &Request, &StatusCode);
+	if (Ret)
+		goto close_handle;
+
+	/* No robots.txt, no rules */
+	if (StatusCode >= HTTP_STATUS_BAD_REQUEST &&
+		StatusCode <= HTTP_STATUS_VERSION_NOT_SUP) {
+		Log("No robots.txt, no rules!");
+		Ret = ERROR_SUCCESS;
+		goto close_handle;
+	}
+
+	Log("Downloaded robots txt!");
+
+	Ret = UrlDownload(Ctx, Request, Page, PageLength);
+	if (Ret)
+		goto close_handle;
+
+	Ctx->Robots.Rules = TRUE;
+	Log("Robots: %p, Length: %d", *Page, *PageLength);
+
+close_handle:
+	InternetCloseHandle(Request);
+	return Ret;
+}
+
+/*
+ * We aren't interested in any Sitemap: entries, only
+ * User-agent: * entries. There's also no point looking
+ * for our user agent as it's not going to be there
+ * anyway.
+ * 
+ * Maybe Crawl-delay ?
+ * 
+ * https://github.com/google/robotstxt/blob/master/robots.h
+ */
+
+#define USER_AGENT_GLOBAL_STRING "User-agent: *"
+
+STATIC
+UINT32
+SessionParseRobotRules(_Inout_ PSESSION_CONTEXT Ctx, _In_ PCHAR Rules,
+					   _In_ DWORD RulesLength)
+{
+
+}
+
+STATIC
+UINT32
+SessionInitRobotRules(_Inout_ PSESSION_CONTEXT Ctx, PPAGE Seed)
+{
+	DWORD PageLength;
+	UINT32 Ret;
+	PCHAR Page;
+
+	Ret = SessionDownloadRobotRules(Ctx, Seed, &Page, &PageLength);
+	if (Ret) {
+		Log("Failed to download robot rules: %d", Ret);
+		return Ret;
+	}
+
+	/* No rules to parse */
+	if (!Ctx->Robots.Rules)
+		return Ret;
+
+	Ret = SessionParseRobotRules(Ctx, Page, PageLength);
+	if (Ret) {
+		Log("Failed to parse robot rules: %d", Ret);
+		return Ret;
+	}
+
+	return Ret;
 }
 
 STATIC
 UINT32
 SessionSeed(_Inout_ PSESSION_CONTEXT Ctx, _In_ LPSTR Url)
 {
+	UINT32 Ret;
 	PPAGE Seed;
 
 	Seed = PageCreate(Url);
@@ -580,6 +736,8 @@ SessionSeed(_Inout_ PSESSION_CONTEXT Ctx, _In_ LPSTR Url)
 		Log("Failed to open ConnectionHandle: %d", GetLastError());
 		return GetLastError();
 	}
+
+	Ret = SessionInitRobotRules(Ctx, Seed);
 
 	HashSetAddOrContains(&Ctx->Set, Seed);
 	QueuePush(&Ctx->Queue, Seed);
@@ -670,40 +828,18 @@ VOID PageChildrenEnumerate(_In_ PSESSION_CONTEXT Ctx, _In_ LPCSTR PageUrl,
 	}
 }
 
-#define PAGE_READ_CHUNK (64 * 1024)
-
 STATIC
 UINT32 PageChildrenParse(_In_ PSESSION_CONTEXT Ctx, _In_ HINTERNET Request,
 						 _In_ LPCSTR PageUrl)
 {
-	SIZE_T Capacity = PAGE_READ_CHUNK;
-	SIZE_T Length = 0;
-	DWORD BytesRead;
+	DWORD PageLength;
 	PCHAR Page;
+	UINT32 Ret;
 
-	Page = ArenaAlloc(Capacity);
-	if (!Page)
-		return ERROR_NOT_ENOUGH_MEMORY;
+	Ret = UrlDownload(Ctx, Request, &Page, &PageLength);
+	if (Ret)
+		return Ret;
 
-	/* The last byte is kept free for the NUL terminator */
-	do {
-		if (Capacity - Length == 1) {
-			if (ArenaAlloc(PAGE_READ_CHUNK) != Page + Capacity)
-				return ERROR_NOT_ENOUGH_MEMORY;
-
-			Capacity += PAGE_READ_CHUNK;
-		}
-
-		if (!InternetReadFile(Request, Page + Length,
-							  (DWORD)(Capacity - Length - 1), &BytesRead)) {
-			Log("Failed to read page. %d", GetLastError());
-			return ERROR_ACCESS_DENIED;
-		}
-
-		Length += BytesRead;
-	} while (BytesRead);
-
-	Page[Length] = '\0';
 	PageChildrenEnumerate(Ctx, PageUrl, Page);
 
 	return ERROR_SUCCESS;
@@ -736,7 +872,7 @@ ThreadPoolWorkerHandlePage(_In_ PSESSION_CONTEXT Ctx, _In_ PPAGE Page)
 	DWORD StatusCode = 0;
 	UINT32 Ret;
 
-	Ret = UrlDownload(Ctx, &Page->Components, &Request, &StatusCode);
+	Ret = UrlRequestPage(Ctx, &Page->Components, &Request, &StatusCode);
 	if (Ret) {
 		Log("Failed to download URL: %d", Ret);
 		return Ret;
