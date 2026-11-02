@@ -285,6 +285,8 @@ HashSetInit(_Out_ PHASH_SET Set)
 	return ERROR_SUCCESS;
 }
 
+#define THREAD_POOL_WORKER_COUNT 16
+
 typedef struct _THREAD_POOL {
 	PHANDLE ThreadHandles;
 	DWORD ThreadCount;
@@ -460,6 +462,14 @@ STATIC
 UINT32
 SessionInit(_Out_ PSESSION_CONTEXT Ctx)
 {
+	DWORD MaxConns = THREAD_POOL_WORKER_COUNT;
+
+	InternetSetOptionA(NULL, INTERNET_OPTION_MAX_CONNS_PER_1_0_SERVER,
+					   &MaxConns, sizeof(MaxConns));
+
+	InternetSetOptionA(NULL, INTERNET_OPTION_MAX_CONNS_PER_SERVER, &MaxConns,
+					   sizeof(MaxConns));
+
 	Ctx->SessionHandle = InternetOpenA("WinInet", INTERNET_OPEN_TYPE_PRECONFIG,
 									   NULL, NULL, 0);
 	if (!Ctx->SessionHandle) {
@@ -752,8 +762,6 @@ VOID ThreadPoolStart(_In_ PTHREAD_POOL Tp)
 	for (Idx = 0; Idx < Tp->ThreadCount; Idx++)
 		ResumeThread(Tp->ThreadHandles[Idx]);
 }
-
-#define THREAD_POOL_WORKER_COUNT 16
 
 STATIC
 UINT32
