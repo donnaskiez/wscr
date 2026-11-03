@@ -698,12 +698,6 @@ BOOL RobotParseIsNewLine(_In_ CHAR Char)
 }
 
 STATIC
-BOOL RobotParseIsSpace(_In_ CHAR Char)
-{
-	return Char == ' ';
-}
-
-STATIC
 PCHAR
 RobotParseJumpLineEnd(_In_ PCHAR Rules, _In_ DWORD RulesLength)
 {
@@ -716,20 +710,46 @@ RobotParseJumpLineEnd(_In_ PCHAR Rules, _In_ DWORD RulesLength)
 
 STATIC
 PCHAR
-RobotParseTrimSpace(_In_ PCHAR Rules, _In_ DWORD RulesLength)
+RobotParseTrimSpace(_In_ PCHAR Rules, _In_ DWORD RulesLength,
+					_Out_opt_ PDWORD SpaceTrimmed)
 {
 	UINT32 Idx;
 
 	for (Idx = 0; Idx < RulesLength; Idx++)
-		if (!RobotParseIsSpace(Rules[Idx]))
+		if (!IsCharSpaceA(Rules[Idx])) {
+			if (SpaceTrimmed)
+				*SpaceTrimmed = Idx;
 			return &Rules[Idx];
+		}
 }
+
+#define ROBOTS_ALLOW "Allow"
 
 STATIC
 UINT32
 RobotParseRule(_In_ PSESSION_CONTEXT Ctx, _In_ PANSI_STRING Rule)
 {
-	Log("%.*s", Rule->Length, Rule->Buffer);
+	ANSI_STRING SubRule = { .Buffer = Rule->Buffer, .Length = Rule->Length };
+	DWORD SpaceTrimmed;
+	/*
+	 * Since our increment process (for better or worse) relies on the
+	 * original Rule length (i.e. the argument) we can't modify that
+	 * since it represents the entire line, so use a local ANSI_STRING
+	 * for the _actual_ rule.
+	 */
+	PCHAR RuleStart;
+
+	/* Don't care about Allow rules */
+	if (!StrCmpNIA(Rule->Buffer, ROBOTS_ALLOW, strlen(ROBOTS_ALLOW)))
+		return ERROR_SUCCESS;
+
+	RuleStart = StrChrA(Rule->Buffer, ':') + 1;
+	RuleStart = RobotParseTrimSpace(RuleStart, Rule->Length, &SpaceTrimmed);
+
+	SubRule.Length -= ((RuleStart - Rule->Buffer) + (SpaceTrimmed - 1));
+	SubRule.Buffer = RuleStart;
+
+	Log("%.*s", SubRule.Length, SubRule.Buffer);
 }
 
 typedef enum _ROBOT_PARSE_GROUP_STATUS {
@@ -770,9 +790,9 @@ ROBOT_PARSE_GROUP_STATUS RobotSouldParseRule(_In_ PROBOT_PARSE_GROUP_CTX Ctx,
 		 * USER-AGENT:   *    # everyone
 		 */
 		RuleStart = Rule->Buffer + strlen(ROBOTS_USER_AGENT);
-		RuleStart = RobotParseTrimSpace(RuleStart, Rule->Length);
+		RuleStart = RobotParseTrimSpace(RuleStart, Rule->Length, NULL);
 		RuleStart++;
-		RuleStart = RobotParseTrimSpace(RuleStart, Rule->Length);
+		RuleStart = RobotParseTrimSpace(RuleStart, Rule->Length, NULL);
 
 		if (*RuleStart != '\*')
 			Ctx->GroupStatus = ROBOT_PARSE_GROUP_SKIP;
@@ -803,7 +823,7 @@ RobotParse(_Inout_ PSESSION_CONTEXT Ctx, _In_ PCHAR Rules,
 		if (RobotParseIsNewLine(Rules[Idx]))
 			continue;
 
-		Entry.Buffer = RobotParseTrimSpace(&Rules[Idx], RulesLength);
+		Entry.Buffer = RobotParseTrimSpace(&Rules[Idx], RulesLength, NULL);
 		Entry.Length =
 				RobotParseJumpLineEnd(Entry.Buffer, RulesLength) - Entry.Buffer;
 		Entry.MaximumLength = min(ROBOTS_MAX_LINE_LEN, RulesLength);
