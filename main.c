@@ -4,6 +4,7 @@
 #include <stdarg.h>
 #include <wininet.h>
 #include <shlwapi.h>
+#include <winternl.h>
 
 #pragma comment(lib, "Wininet.lib")
 #pragma comment(lib, "Shlwapi.lib")
@@ -313,7 +314,7 @@ typedef struct _SESSION_CONTEXT {
 
 	struct {
 		/* Is there robot rules? */
-		BOOL Rules;
+		BOOL IsRules;
 
 		PROBOTS_RULE Rules;
 		DWORD RuleCount;
@@ -658,7 +659,7 @@ SessionDownloadRobotRules(_In_ PSESSION_CONTEXT Ctx, _In_ PPAGE Seed,
 	if (Ret)
 		goto close_handle;
 
-	Ctx->Robots.Rules = TRUE;
+	Ctx->Robots.IsRules = TRUE;
 	Log("Robots: %p, Length: %d", *Page, *PageLength);
 
 close_handle:
@@ -677,14 +678,144 @@ close_handle:
  * https://github.com/google/robotstxt/blob/master/robots.h
  */
 
-#define USER_AGENT_GLOBAL_STRING "User-agent: *"
+#define ROBOTS_USER_AGENT "User-agent"
+#define ROBOTS_SITE_MAP "Sitemap"
+#define ROBOTS_NO_INDEX "Noindex"
+
+/* https://github.com/google/robotstxt/blob/22b355ff855419e6a3ff8ff09c0ad7fdb17116f9/robots.cc#L418 */
+#define ROBOTS_MAX_LINE_LEN 2083
+
+STATIC
+BOOL RobotParseIsComment(_In_ CHAR Char)
+{
+	return Char == '\#';
+}
+
+STATIC
+BOOL RobotParseIsNewLine(_In_ CHAR Char)
+{
+	return Char == '\r' || Char == '\n';
+}
+
+STATIC
+BOOL RobotParseIsSpace(_In_ CHAR Char)
+{
+	return Char == ' ';
+}
+
+STATIC
+PCHAR
+RobotParseJumpLineEnd(_In_ PCHAR Rules, _In_ DWORD RulesLength)
+{
+	UINT32 Idx;
+
+	for (Idx = 0; Idx < RulesLength; Idx++)
+		if (RobotParseIsNewLine(Rules[Idx]))
+			return &Rules[Idx];
+}
+
+STATIC
+PCHAR
+RobotParseTrimSpace(_In_ PCHAR Rules, _In_ DWORD RulesLength)
+{
+	UINT32 Idx;
+
+	for (Idx = 0; Idx < RulesLength; Idx++)
+		if (!RobotParseIsSpace(Rules[Idx]))
+			return &Rules[Idx];
+}
 
 STATIC
 UINT32
-SessionParseRobotRules(_Inout_ PSESSION_CONTEXT Ctx, _In_ PCHAR Rules,
-					   _In_ DWORD RulesLength)
+RobotParseRule(_In_ PSESSION_CONTEXT Ctx, _In_ PANSI_STRING Rule)
 {
+	Log("%.*s", Rule->Length, Rule->Buffer);
+}
 
+typedef enum _ROBOT_PARSE_GROUP_STATUS {
+	ROBOT_PARSE_GROUP_ALL,
+	ROBOT_PARSE_GROUP_SKIP,
+} ROBOT_PARSE_GROUP_STATUS;
+
+typedef struct _ROBOT_PARSE_GROUP_CTX {
+	ROBOT_PARSE_GROUP_STATUS GroupStatus;
+} ROBOT_PARSE_GROUP_CTX, *PROBOT_PARSE_GROUP_CTX;
+
+STATIC
+ROBOT_PARSE_GROUP_STATUS RobotSouldParseRule(_In_ PROBOT_PARSE_GROUP_CTX Ctx,
+											 _In_ PANSI_STRING Rule)
+{
+	PCHAR RuleStart;
+
+	if (RobotParseIsComment(*Rule->Buffer))
+		return FALSE;
+
+	/* Not interested in sitemaps since we arent indexing */
+	if (!StrCmpNIA(Rule->Buffer, ROBOTS_SITE_MAP, strlen(ROBOTS_SITE_MAP)))
+		return FALSE;
+
+	/* Also not interested in the Noindex rule */
+	if (!StrCmpNIA(Rule->Buffer, ROBOTS_NO_INDEX, strlen(ROBOTS_NO_INDEX)))
+		return FALSE;
+
+	if (!StrCmpNIA(Rule->Buffer, ROBOTS_USER_AGENT,
+				   strlen(ROBOTS_USER_AGENT))) {
+		/*
+		 * Since we only care about *, just normalise any spacing between
+		 * the identifier ':' and the asterisk.
+		 *
+		 * User-agent:*
+		 * User-agent: *
+		 * user-agent : *
+		 * USER-AGENT:   *    # everyone
+		 */
+		RuleStart = Rule->Buffer + strlen(ROBOTS_USER_AGENT);
+		RuleStart = RobotParseTrimSpace(RuleStart, Rule->Length);
+		RuleStart++;
+		RuleStart = RobotParseTrimSpace(RuleStart, Rule->Length);
+
+		if (*RuleStart != '\*')
+			Ctx->GroupStatus = ROBOT_PARSE_GROUP_SKIP;
+		else
+			Ctx->GroupStatus = ROBOT_PARSE_GROUP_ALL;
+
+		/*
+		 * We don't want to parse the group identifier, just set
+		 * the GroupStatus.
+		 */
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+STATIC
+UINT32
+RobotParse(_Inout_ PSESSION_CONTEXT Ctx, _In_ PCHAR Rules,
+		   _In_ DWORD RulesLength)
+{
+	ROBOT_PARSE_GROUP_CTX ParseCtx = { .GroupStatus = ROBOT_PARSE_GROUP_SKIP };
+	UINT32 Idx;
+
+	for (Idx = 0; Idx < RulesLength; Idx++) {
+		ANSI_STRING Entry = { 0 };
+
+		if (RobotParseIsNewLine(Rules[Idx]))
+			continue;
+
+		Entry.Buffer = RobotParseTrimSpace(&Rules[Idx], RulesLength);
+		Entry.Length =
+				RobotParseJumpLineEnd(Entry.Buffer, RulesLength) - Entry.Buffer;
+		Entry.MaximumLength = min(ROBOTS_MAX_LINE_LEN, RulesLength);
+
+		if (RobotSouldParseRule(&ParseCtx, &Entry) &&
+			ParseCtx.GroupStatus == ROBOT_PARSE_GROUP_ALL)
+			RobotParseRule(Ctx, &Entry);
+
+		Idx += Entry.Length;
+	}
+
+	DebugBreak();
 }
 
 STATIC
@@ -702,15 +833,16 @@ SessionInitRobotRules(_Inout_ PSESSION_CONTEXT Ctx, PPAGE Seed)
 	}
 
 	/* No rules to parse */
-	if (!Ctx->Robots.Rules)
+	if (!Ctx->Robots.IsRules)
 		return Ret;
 
-	Ret = SessionParseRobotRules(Ctx, Page, PageLength);
+	Ret = RobotParse(Ctx, Page, PageLength);
 	if (Ret) {
 		Log("Failed to parse robot rules: %d", Ret);
 		return Ret;
 	}
 
+	DebugBreak();
 	return Ret;
 }
 
@@ -951,6 +1083,8 @@ ThreadPoolInit(_In_ PSESSION_CONTEXT Ctx, _Out_ PTHREAD_POOL Tp)
 			Tp->ThreadCount = Idx;
 			goto error;
 		}
+
+		SetThreadAffinityMask(Tp->ThreadHandles[Idx], 1ULL << Idx);
 	}
 
 	return ERROR_SUCCESS;
