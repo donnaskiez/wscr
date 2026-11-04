@@ -321,6 +321,11 @@ typedef struct _SESSION_CONTEXT {
 		PAGE Page;
 	} Robots;
 
+	struct {
+		UINT32 PagesParsed;
+		UINT32 PagesRobotsBlocked;
+	} Stats;
+
 } SESSION_CONTEXT, *PSESSION_CONTEXT;
 
 /*
@@ -1051,6 +1056,7 @@ PageChildrenParseEntry(_In_ PSESSION_CONTEXT Ctx, _In_ LPCSTR PageUrl,
 
 	if (!PageRobotAllowed(Ctx, Page)) {
 		Log("Robots blocked: %s", Page->AbsoluteUrl);
+		InterlockedIncrement(&Ctx->Stats.PagesRobotsBlocked);
 		return NULL;
 	}
 
@@ -1070,6 +1076,7 @@ VOID PageChildrenAddEntry(_In_ PSESSION_CONTEXT Ctx, _In_ LPCSTR PageUrl,
 	if (HashSetAddOrContains(&Ctx->Set, ChildPage) == HASH_SET_PAGE_EXIST)
 		return;
 
+	InterlockedIncrement(&Ctx->Stats.PagesParsed);
 	QueuePush(&Ctx->Queue, ChildPage);
 }
 
@@ -1299,6 +1306,11 @@ Scrape(_In_ LPSTR Url)
 
 	/* Workers exit by themselves once Outstanding reaches 0 */
 	ThreadPoolDeInit(&Ctx.Pool);
+
+	Log("==================================");
+	Log("Pages Parsed: %d", Ctx.Stats.PagesParsed);
+	Log("Pages Robots Blocked: %d", Ctx.Stats.PagesRobotsBlocked);
+	Log("==================================");
 
 thread_pool_fail:
 session_init_fail:
