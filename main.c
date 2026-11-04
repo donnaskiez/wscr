@@ -296,9 +296,8 @@ typedef struct _THREAD_POOL {
 } THREAD_POOL, *PTHREAD_POOL;
 
 typedef struct _ROBOTS_RULE {
-	BOOL Allow;
-	PCHAR Pattern;
-	DWORD Length;
+	struct _ROBOTS_RULE *Next;
+	ANSI_STRING Rule;
 } ROBOTS_RULE, *PROBOTS_RULE;
 
 typedef struct _SESSION_CONTEXT {
@@ -316,8 +315,9 @@ typedef struct _SESSION_CONTEXT {
 		/* Is there robot rules? */
 		BOOL IsRules;
 
-		PROBOTS_RULE Rules;
-		DWORD RuleCount;
+		PROBOTS_RULE Head;
+		PROBOTS_RULE Tail;
+
 		PAGE Page;
 	} Robots;
 
@@ -569,6 +569,10 @@ UrlDownload(_In_ PSESSION_CONTEXT Ctx, _In_ HINTERNET Request,
 STATIC
 PPAGE PageCreate(_Inout_ PCHAR Url)
 {
+	DWORD CanonicalLength = 1;
+	PCHAR Canonical;
+	CHAR Probe;
+	HRESULT Hr;
 	UINT32 Ret;
 	PPAGE Page;
 
@@ -578,16 +582,35 @@ PPAGE PageCreate(_Inout_ PCHAR Url)
 
 	UrlStripFragment(Url);
 
-	/* TODO: lower case scheme + hostname */
+	/*
+	 * Make sure we normalise spelling of scheme + hostname and
+	 * handle cases where a trailing '/' for example isn't passed
+	 * as the seed.
+	 */
+	Hr = UrlCanonicalizeA(Url, &Probe, &CanonicalLength, 0);
+	if (Hr != E_POINTER) {
+		Log("Failed to retrieve canonical URL size: 0x%08lx", Hr);
+		return NULL;
+	}
 
-	Ret = UrlParse(Url, &Page->Components);
+	Canonical = ArenaAlloc(CanonicalLength);
+	if (!Canonical)
+		return NULL;
+
+	Hr = UrlCanonicalizeA(Url, Canonical, &CanonicalLength, 0);
+	if (FAILED(Hr)) {
+		Log("Failed to canonicalise URL %d", GetLastError());
+		return NULL;
+	}
+
+	Ret = UrlParse(Canonical, &Page->Components);
 	if (Ret != ERROR_SUCCESS) {
 		Log("Failed to parse URL: %u", Ret);
 		return NULL;
 	}
 
-	Page->AbsoluteUrl = Url;
-	Page->AbsoluteUrlLength = (DWORD)strlen(Url);
+	Page->AbsoluteUrl = Canonical;
+	Page->AbsoluteUrlLength = CanonicalLength;
 	return Page;
 }
 
@@ -706,6 +729,8 @@ RobotParseJumpLineEnd(_In_ PCHAR Rules, _In_ DWORD RulesLength)
 	for (Idx = 0; Idx < RulesLength; Idx++)
 		if (RobotParseIsNewLine(Rules[Idx]))
 			return &Rules[Idx];
+
+	return &Rules[RulesLength];
 }
 
 STATIC
@@ -715,28 +740,55 @@ RobotParseTrimSpace(_In_ PCHAR Rules, _In_ DWORD RulesLength,
 {
 	UINT32 Idx;
 
+	if (SpaceTrimmed)
+		*SpaceTrimmed = 0;
+
 	for (Idx = 0; Idx < RulesLength; Idx++)
 		if (!IsCharSpaceA(Rules[Idx])) {
 			if (SpaceTrimmed)
 				*SpaceTrimmed = Idx;
 			return &Rules[Idx];
 		}
+
+	return &Rules[RulesLength];
 }
 
 #define ROBOTS_ALLOW "Allow"
 
 STATIC
+VOID RobotInsertRule(_In_ PSESSION_CONTEXT Ctx, _In_ PROBOTS_RULE Rule)
+{
+	if (!Ctx->Robots.Head) {
+		Ctx->Robots.Head = Rule;
+		Ctx->Robots.Tail = Rule;
+		Rule->Next = NULL;
+		return;
+	}
+
+	Ctx->Robots.Tail->Next = Rule;
+	Ctx->Robots.Tail = Rule;
+}
+
+STATIC PROBOTS_RULE RobotAllocRule(_In_ PSESSION_CONTEXT Ctx, _In_ PCHAR Rule,
+								   _In_ DWORD RuleLength)
+{
+	PROBOTS_RULE _Rule;
+
+	_Rule = ArenaAlloc(sizeof(*_Rule));
+	if (!_Rule)
+		return NULL;
+
+	_Rule->Rule.Buffer = Rule;
+	_Rule->Rule.Length = RuleLength;
+	return _Rule;
+}
+
+STATIC
 UINT32
 RobotParseRule(_In_ PSESSION_CONTEXT Ctx, _In_ PANSI_STRING Rule)
 {
-	ANSI_STRING SubRule = { .Buffer = Rule->Buffer, .Length = Rule->Length };
+	PROBOTS_RULE _Rule;
 	DWORD SpaceTrimmed;
-	/*
-	 * Since our increment process (for better or worse) relies on the
-	 * original Rule length (i.e. the argument) we can't modify that
-	 * since it represents the entire line, so use a local ANSI_STRING
-	 * for the _actual_ rule.
-	 */
 	PCHAR RuleStart;
 
 	/* Don't care about Allow rules */
@@ -746,10 +798,15 @@ RobotParseRule(_In_ PSESSION_CONTEXT Ctx, _In_ PANSI_STRING Rule)
 	RuleStart = StrChrA(Rule->Buffer, ':') + 1;
 	RuleStart = RobotParseTrimSpace(RuleStart, Rule->Length, &SpaceTrimmed);
 
-	SubRule.Length -= ((RuleStart - Rule->Buffer) + (SpaceTrimmed - 1));
-	SubRule.Buffer = RuleStart;
+	_Rule = RobotAllocRule(
+			Ctx, RuleStart,
+			Rule->Length - ((RuleStart - Rule->Buffer) + (SpaceTrimmed - 1)));
+	if (!_Rule)
+		return ERROR_NOT_ENOUGH_MEMORY;
 
-	Log("%.*s", SubRule.Length, SubRule.Buffer);
+	RobotInsertRule(Ctx, _Rule);
+
+	return ERROR_SUCCESS;
 }
 
 typedef enum _ROBOT_PARSE_GROUP_STATUS {
@@ -815,7 +872,7 @@ RobotParse(_Inout_ PSESSION_CONTEXT Ctx, _In_ PCHAR Rules,
 		   _In_ DWORD RulesLength)
 {
 	ROBOT_PARSE_GROUP_CTX ParseCtx = { .GroupStatus = ROBOT_PARSE_GROUP_SKIP };
-	UINT32 Idx;
+	UINT32 Idx, Ret;
 
 	for (Idx = 0; Idx < RulesLength; Idx++) {
 		ANSI_STRING Entry = { 0 };
@@ -829,13 +886,19 @@ RobotParse(_Inout_ PSESSION_CONTEXT Ctx, _In_ PCHAR Rules,
 		Entry.MaximumLength = min(ROBOTS_MAX_LINE_LEN, RulesLength);
 
 		if (RobotSouldParseRule(&ParseCtx, &Entry) &&
-			ParseCtx.GroupStatus == ROBOT_PARSE_GROUP_ALL)
-			RobotParseRule(Ctx, &Entry);
+			ParseCtx.GroupStatus == ROBOT_PARSE_GROUP_ALL) {
+			Ret = RobotParseRule(Ctx, &Entry);
+			if (Ret) {
+				Log("Failed to parse robot rules: %d", Ret);
+				goto increment;
+			}
+		}
 
+increment:
 		Idx += Entry.Length;
 	}
 
-	DebugBreak();
+	return ERROR_SUCCESS;
 }
 
 STATIC
@@ -862,7 +925,6 @@ SessionInitRobotRules(_Inout_ PSESSION_CONTEXT Ctx, PPAGE Seed)
 		return Ret;
 	}
 
-	DebugBreak();
 	return Ret;
 }
 
@@ -897,6 +959,64 @@ SessionSeed(_Inout_ PSESSION_CONTEXT Ctx, _In_ LPSTR Url)
 }
 
 STATIC
+BOOL __PageRobotAllowed(_In_ PSESSION_CONTEXT Ctx, _In_ PANSI_STRING Rule,
+						_In_ PCHAR Path, _In_ DWORD PathLen)
+{
+	UINT32 Idx = 0, Jdx = 0;
+	UINT32 Star = 0, Mark = 0;
+	BOOL HaveStar = FALSE;
+
+	while (Idx < Rule->Length) {
+		if (Rule->Buffer[Idx] == '*') {
+			HaveStar = TRUE;
+			Star = Idx;
+			Mark = Jdx;
+			Idx++;
+		} else if (Jdx < PathLen && Rule->Buffer[Idx] == Path[Jdx]) {
+			Idx++;
+			Jdx++;
+		} else if (HaveStar && Mark < PathLen) {
+			Mark++;
+			Jdx = Mark;
+			Idx = Star + 1;
+		} else {
+			return TRUE;
+		}
+	}
+
+	return FALSE;
+}
+
+STATIC
+BOOL PageRobotAllowed(_In_ PSESSION_CONTEXT Ctx, _In_ PPAGE Page)
+{
+	PROBOTS_RULE Rule = Ctx->Robots.Head;
+	PCHAR PathStart;
+	DWORD PathLen;
+
+	/* Rules are compared against the path only, so remove scheme + hostname */
+	PathLen = Page->Components.dwUrlPathLength +
+			  Page->Components.dwExtraInfoLength;
+	PathStart = Page->AbsoluteUrl + Page->AbsoluteUrlLength - PathLen;
+
+	if (!Ctx->Robots.IsRules)
+		return TRUE;
+
+	/* empty path */
+	if (!PathLen)
+		return TRUE;
+
+	while (Rule) {
+		if (!__PageRobotAllowed(Ctx, &Rule->Rule, PathStart, PathLen))
+			return FALSE;
+
+		Rule = Rule->Next;
+	}
+
+	return TRUE;
+}
+
+STATIC
 PPAGE
 PageChildrenParseEntry(_In_ PSESSION_CONTEXT Ctx, _In_ LPCSTR PageUrl,
 					   _In_ PVOID Base, _In_ DWORD Length)
@@ -928,6 +1048,11 @@ PageChildrenParseEntry(_In_ PSESSION_CONTEXT Ctx, _In_ LPCSTR PageUrl,
 		StrCmpA(Page->Components.lpszHostName,
 				Ctx->Seed->Components.lpszHostName))
 		return NULL;
+
+	if (!PageRobotAllowed(Ctx, Page)) {
+		Log("Robots blocked: %s", Page->AbsoluteUrl);
+		return NULL;
+	}
 
 	return Page;
 }

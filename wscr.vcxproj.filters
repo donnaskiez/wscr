@@ -22,5 +22,6 @@
   <ItemGroup>
     <None Include="README.md" />
     <None Include=".clang-format" />
+    <None Include="DESIGN.md" />
   </ItemGroup>
 </Project>

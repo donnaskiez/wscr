@@ -137,6 +137,10 @@
   </ItemGroup>
   <ItemGroup>
     <None Include=".clang-format" />
+    <None Include="DESIGN.md">
+      <SubType>
+      </SubType>
+    </None>
     <None Include="README.md">
       <SubType>
       </SubType>
