@@ -326,6 +326,9 @@ typedef struct _SESSION_CONTEXT {
 		UINT32 PagesRobotsBlocked;
 	} Stats;
 
+	UINT64 StartTime;
+	UINT64 EndTime;
+
 } SESSION_CONTEXT, *PSESSION_CONTEXT;
 
 /*
@@ -375,15 +378,12 @@ UrlRequestPage(_In_ PSESSION_CONTEXT Ctx, _In_ LPURL_COMPONENTSA Url,
 
 	*RequestHandle = HttpOpenRequestA(Ctx->ConnectionHandle, "GET", Object,
 									  NULL, NULL, NULL, Flags, NULL);
-	if (!*RequestHandle) {
-		Log("Failed to open HttpRequest handle: %d", GetLastError());
+	if (!*RequestHandle)
 		return ERROR_BAD_ARGUMENTS;
-	}
 
 	Ret = HttpSendRequestA(*RequestHandle, NULL, 0, NULL, 0);
 	if (!Ret) {
 		Status = GetLastError();
-		Log("Failed to send HttpRequest: %u", Status);
 		goto request_fail;
 	}
 
@@ -391,7 +391,6 @@ UrlRequestPage(_In_ PSESSION_CONTEXT Ctx, _In_ LPURL_COMPONENTSA Url,
 						 HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER,
 						 StatusCode, &BufLength, NULL);
 	if (!Ret) {
-		Log("Failied to query status code: %d", GetLastError());
 		Status = ERROR_ACCESS_DENIED;
 		goto request_fail;
 	}
@@ -399,7 +398,6 @@ UrlRequestPage(_In_ PSESSION_CONTEXT Ctx, _In_ LPURL_COMPONENTSA Url,
 	/* Redirects are handed back so the Location goes through the link path */
 	if (*StatusCode != HTTP_STATUS_OK &&
 		!HTTP_STATUS_IS_REDIRECT(*StatusCode)) {
-		Log("HTTPS Query Failed. Status: %d", *StatusCode);
 		Status = ERROR_ACCESS_DENIED;
 		goto request_fail;
 	}
@@ -429,45 +427,33 @@ UrlParse(_In_ LPCSTR Url, _Out_ LPURL_COMPONENTSA Components)
 	Components->lpszExtraInfo = NULL;
 
 	Ret = InternetCrackUrlA(Url, (DWORD)strlen(Url), 0, Components);
-	if (!Ret) {
-		Log("Failed to retrieve required buf sizes: %d", GetLastError());
+	if (!Ret)
 		return ERROR_BAD_ARGUMENTS;
-	}
 
 	Components->lpszHostName = ArenaAlloc(Components->dwHostNameLength + 1);
-	if (!Components->lpszHostName) {
-		Log("Failed to allocate HostName buffer: %d", GetLastError());
+	if (!Components->lpszHostName)
 		return ERROR_NOT_ENOUGH_MEMORY;
-	}
 
 	Components->dwHostNameLength++;
 	Components->lpszUrlPath = ArenaAlloc(Components->dwUrlPathLength + 1);
-	if (!Components->lpszUrlPath) {
-		Log("Failed to allocate URLPath buffer: %d", GetLastError());
+	if (!Components->lpszUrlPath)
 		return ERROR_NOT_ENOUGH_MEMORY;
-	}
 
 	Components->dwUrlPathLength++;
 	Components->lpszScheme = ArenaAlloc(Components->dwSchemeLength + 1);
-	if (!Components->lpszScheme) {
-		Log("Failed to allocate URL Scheme buffer: %d", GetLastError());
+	if (!Components->lpszScheme)
 		return ERROR_NOT_ENOUGH_MEMORY;
-	}
 
 	Components->dwSchemeLength++;
 	Components->lpszExtraInfo = ArenaAlloc(Components->dwExtraInfoLength + 1);
-	if (!Components->lpszExtraInfo) {
-		Log("Failed to allocate URL Extra Info buffer: %d", GetLastError());
+	if (!Components->lpszExtraInfo)
 		return ERROR_NOT_ENOUGH_MEMORY;
-	}
 
 	Components->dwExtraInfoLength++;
 
 	Ret = InternetCrackUrlA(Url, (DWORD)strlen(Url), 0, Components);
-	if (!Ret) {
-		Log("Failed to parse URL: %d", GetLastError());
+	if (!Ret)
 		return ERROR_BAD_ARGUMENTS;
-	}
 
 	return ERROR_SUCCESS;
 }
@@ -495,10 +481,8 @@ SessionInit(_Out_ PSESSION_CONTEXT Ctx)
 
 	Ctx->SessionHandle = InternetOpenA(
 			USER_AGENT_NAME, INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
-	if (!Ctx->SessionHandle) {
-		Log("Failed to open SessionHandle: %d", GetLastError());
+	if (!Ctx->SessionHandle)
 		return GetLastError();
-	}
 
 	return ERROR_SUCCESS;
 }
@@ -522,10 +506,8 @@ UrlBuildAbsoluteFromRelative(_In_ LPCSTR PageUrl, _In_ LPCSTR Relative)
 		return NULL;
 
 	if (!InternetCombineUrlA(PageUrl, Relative, Absolute, &AbsoluteLength,
-							 ICU_BROWSER_MODE)) {
-		Log("InternetCombineUrlA failed: %d", GetLastError());
+							 ICU_BROWSER_MODE))
 		return NULL;
-	}
 
 	return Absolute;
 }
@@ -558,10 +540,8 @@ UrlDownload(_In_ PSESSION_CONTEXT Ctx, _In_ HINTERNET Request,
 		}
 
 		if (!InternetReadFile(Request, *Page + Length,
-							  (DWORD)(Capacity - Length - 1), &BytesRead)) {
-			Log("Failed to read page. %d", GetLastError());
+							  (DWORD)(Capacity - Length - 1), &BytesRead))
 			return ERROR_ACCESS_DENIED;
-		}
 
 		Length += BytesRead;
 	} while (BytesRead);
@@ -593,33 +573,27 @@ PPAGE PageCreate(_Inout_ PCHAR Url)
 	 * as the seed.
 	 */
 	Hr = UrlCanonicalizeA(Url, &Probe, &CanonicalLength, 0);
-	if (Hr != E_POINTER) {
-		Log("Failed to retrieve canonical URL size: 0x%08lx", Hr);
+	if (Hr != E_POINTER)
 		return NULL;
-	}
 
 	Canonical = ArenaAlloc(CanonicalLength);
 	if (!Canonical)
 		return NULL;
 
 	Hr = UrlCanonicalizeA(Url, Canonical, &CanonicalLength, 0);
-	if (FAILED(Hr)) {
-		Log("Failed to canonicalise URL %d", GetLastError());
+	if (FAILED(Hr))
 		return NULL;
-	}
 
 	Ret = UrlParse(Canonical, &Page->Components);
-	if (Ret != ERROR_SUCCESS) {
-		Log("Failed to parse URL: %u", Ret);
+	if (Ret != ERROR_SUCCESS)
 		return NULL;
-	}
 
 	Page->AbsoluteUrl = Canonical;
 	Page->AbsoluteUrlLength = CanonicalLength;
 	return Page;
 }
 
-#define ROBOTS_TXT_STRING "robots.txt"
+#define ROBOTS_TXT_STRING "/robots.txt"
 
 /*
  * https://www.rfc-editor.org/info/rfc9309/
@@ -630,65 +604,41 @@ UINT32
 SessionDownloadRobotRules(_In_ PSESSION_CONTEXT Ctx, _In_ PPAGE Seed,
 						  _Out_ PCHAR *Page, _Out_ PDWORD PageLength)
 {
-	UINT32 RobotsUrlLength;
 	HINTERNET Request;
 	DWORD StatusCode;
 	PCHAR RobotsUrl;
 	PPAGE Robots;
 	UINT32 Ret;
-	BOOL AddSlash = FALSE;
 
 	*Page = NULL;
 	*PageLength = 0;
 
-	/* Handle seed URLs without a trailing "/" */
-	RobotsUrlLength = Seed->AbsoluteUrlLength + strlen(ROBOTS_TXT_STRING) + 1;
-	if (Seed->AbsoluteUrl[Seed->AbsoluteUrlLength - 1] != '/') {
-		RobotsUrlLength++;
-		AddSlash = TRUE;
-	}
-
-	RobotsUrl = ArenaAlloc(RobotsUrlLength);
-	if (!RobotsUrlLength)
+	RobotsUrl =
+			UrlBuildAbsoluteFromRelative(Seed->AbsoluteUrl, ROBOTS_TXT_STRING);
+	if (!RobotsUrl)
 		return ERROR_NOT_ENOUGH_MEMORY;
-
-	RtlCopyMemory(RobotsUrl, Seed->AbsoluteUrl, Seed->AbsoluteUrlLength);
-
-	if (AddSlash) {
-		RtlCopyMemory(RobotsUrl + Seed->AbsoluteUrlLength, "/", 1);
-		RtlCopyMemory(RobotsUrl + Seed->AbsoluteUrlLength + 1,
-					  ROBOTS_TXT_STRING, strlen(ROBOTS_TXT_STRING));
-	} else {
-		RtlCopyMemory(RobotsUrl + Seed->AbsoluteUrlLength, ROBOTS_TXT_STRING,
-					  strlen(ROBOTS_TXT_STRING));
-	}
-
-	RobotsUrl[RobotsUrlLength] = '\0';
 
 	Robots = PageCreate(RobotsUrl);
 	if (!Robots)
 		return ERROR_NOT_ENOUGH_MEMORY;
 
 	Ret = UrlRequestPage(Ctx, &Robots->Components, &Request, &StatusCode);
-	if (Ret)
-		goto close_handle;
 
 	/* No robots.txt, no rules */
 	if (StatusCode >= HTTP_STATUS_BAD_REQUEST &&
-		StatusCode <= HTTP_STATUS_VERSION_NOT_SUP) {
-		Log("No robots.txt, no rules!");
-		Ret = ERROR_SUCCESS;
-		goto close_handle;
+		StatusCode < HTTP_STATUS_SERVER_ERROR) {
+		Ctx->Robots.IsRules = FALSE;
+		return ERROR_SUCCESS;
 	}
 
-	Log("Downloaded robots txt!");
+	if (Ret)
+		return Ret;
 
 	Ret = UrlDownload(Ctx, Request, Page, PageLength);
 	if (Ret)
 		goto close_handle;
 
 	Ctx->Robots.IsRules = TRUE;
-	Log("Robots: %p, Length: %d", *Page, *PageLength);
 
 close_handle:
 	InternetCloseHandle(Request);
@@ -893,10 +843,8 @@ RobotParse(_Inout_ PSESSION_CONTEXT Ctx, _In_ PCHAR Rules,
 		if (RobotSouldParseRule(&ParseCtx, &Entry) &&
 			ParseCtx.GroupStatus == ROBOT_PARSE_GROUP_ALL) {
 			Ret = RobotParseRule(Ctx, &Entry);
-			if (Ret) {
-				Log("Failed to parse robot rules: %d", Ret);
+			if (Ret)
 				goto increment;
-			}
 		}
 
 increment:
@@ -910,57 +858,20 @@ STATIC
 UINT32
 SessionInitRobotRules(_Inout_ PSESSION_CONTEXT Ctx, PPAGE Seed)
 {
+	PROBOTS_RULE Rule;
 	DWORD PageLength;
 	UINT32 Ret;
 	PCHAR Page;
 
 	Ret = SessionDownloadRobotRules(Ctx, Seed, &Page, &PageLength);
-	if (Ret) {
-		Log("Failed to download robot rules: %d", Ret);
+	if (Ret)
 		return Ret;
-	}
 
 	/* No rules to parse */
 	if (!Ctx->Robots.IsRules)
 		return Ret;
 
-	Ret = RobotParse(Ctx, Page, PageLength);
-	if (Ret) {
-		Log("Failed to parse robot rules: %d", Ret);
-		return Ret;
-	}
-
-	return Ret;
-}
-
-STATIC
-UINT32
-SessionSeed(_Inout_ PSESSION_CONTEXT Ctx, _In_ LPSTR Url)
-{
-	UINT32 Ret;
-	PPAGE Seed;
-
-	Seed = PageCreate(Url);
-	if (!Seed) {
-		Log("Failed to create seed page");
-		return ERROR_BAD_ARGUMENTS;
-	}
-
-	Ctx->Seed = Seed;
-	Ctx->ConnectionHandle = InternetConnectA(Ctx->SessionHandle,
-											 Seed->Components.lpszHostName,
-											 Seed->Components.nPort, NULL, NULL,
-											 INTERNET_SERVICE_HTTP, 0, NULL);
-	if (!Ctx->ConnectionHandle) {
-		Log("Failed to open ConnectionHandle: %d", GetLastError());
-		return GetLastError();
-	}
-
-	Ret = SessionInitRobotRules(Ctx, Seed);
-
-	HashSetAddOrContains(&Ctx->Set, Seed);
-	QueuePush(&Ctx->Queue, Seed);
-	return ERROR_SUCCESS;
+	return RobotParse(Ctx, Page, PageLength);
 }
 
 STATIC
@@ -1022,6 +933,37 @@ BOOL PageRobotAllowed(_In_ PSESSION_CONTEXT Ctx, _In_ PPAGE Page)
 }
 
 STATIC
+UINT32
+SessionSeed(_Inout_ PSESSION_CONTEXT Ctx, _In_ LPSTR Url)
+{
+	UINT32 Ret;
+	PPAGE Seed;
+
+	Seed = PageCreate(Url);
+	if (!Seed)
+		return ERROR_BAD_ARGUMENTS;
+
+	Ctx->Seed = Seed;
+	Ctx->ConnectionHandle = InternetConnectA(Ctx->SessionHandle,
+											 Seed->Components.lpszHostName,
+											 Seed->Components.nPort, NULL, NULL,
+											 INTERNET_SERVICE_HTTP, 0, NULL);
+	if (!Ctx->ConnectionHandle)
+		return GetLastError();
+
+	Ret = SessionInitRobotRules(Ctx, Seed);
+	if (Ret)
+		return Ret;
+
+	if (!PageRobotAllowed(Ctx, Seed))
+		return ERROR_ACCESS_DENIED;
+
+	HashSetAddOrContains(&Ctx->Set, Seed);
+	QueuePush(&Ctx->Queue, Seed);
+	return ERROR_SUCCESS;
+}
+
+STATIC
 PPAGE
 PageChildrenParseEntry(_In_ PSESSION_CONTEXT Ctx, _In_ LPCSTR PageUrl,
 					   _In_ PVOID Base, _In_ DWORD Length)
@@ -1038,10 +980,8 @@ PageChildrenParseEntry(_In_ PSESSION_CONTEXT Ctx, _In_ LPCSTR PageUrl,
 	/* If its a relative, rebuild absolute */
 	if (!UrlIsA(Url, URLIS_URL)) {
 		Url = UrlBuildAbsoluteFromRelative(PageUrl, Url);
-		if (!Url) {
-			Log("Failed to build absolute URL: %lu", GetLastError());
+		if (!Url)
 			return NULL;
-		}
 	}
 
 	Page = PageCreate(Url);
@@ -1055,7 +995,6 @@ PageChildrenParseEntry(_In_ PSESSION_CONTEXT Ctx, _In_ LPCSTR PageUrl,
 		return NULL;
 
 	if (!PageRobotAllowed(Ctx, Page)) {
-		Log("Robots blocked: %s", Page->AbsoluteUrl);
 		InterlockedIncrement(&Ctx->Stats.PagesRobotsBlocked);
 		return NULL;
 	}
@@ -1080,23 +1019,38 @@ VOID PageChildrenAddEntry(_In_ PSESSION_CONTEXT Ctx, _In_ LPCSTR PageUrl,
 	QueuePush(&Ctx->Queue, ChildPage);
 }
 
+#define HTML_LINK "a href=\""
+#define COMMENT_OPEN "<!--"
+#define COMMENT_CLOSE "-->"
+
 STATIC
 VOID PageChildrenEnumerate(_In_ PSESSION_CONTEXT Ctx, _In_ LPCSTR PageUrl,
 						   _In_ PVOID Page)
 {
 	PCHAR PageIndex = (PCHAR)Page;
-	PCHAR String = "a href=\"";
+	PCHAR Comment = StrStrA(PageIndex, COMMENT_OPEN);
 
 	while (TRUE) {
-		PCHAR Href = StrStrA(PageIndex, String);
+		PCHAR Href = StrStrA(PageIndex, HTML_LINK);
 		UINT32 UrlLen;
 		PCHAR UrlEnd;
 
 		if (!Href)
 			break;
 
+		/* Don't count links in comments */
+		if (Comment && Comment < Href) {
+			PageIndex = StrStrA(Comment + strlen(COMMENT_OPEN), COMMENT_CLOSE);
+			if (!PageIndex)
+				break;
+
+			PageIndex += strlen(COMMENT_CLOSE);
+			Comment = StrStrA(PageIndex, COMMENT_OPEN);
+			continue;
+		}
+
 		/* a href=" */
-		Href += strlen(String);
+		Href += strlen(HTML_LINK);
 
 		/* Find end of URL */
 		UrlEnd = StrChrA(Href, '"');
@@ -1157,16 +1111,12 @@ ThreadPoolWorkerHandlePage(_In_ PSESSION_CONTEXT Ctx, _In_ PPAGE Page)
 	UINT32 Ret;
 
 	Ret = UrlRequestPage(Ctx, &Page->Components, &Request, &StatusCode);
-	if (Ret) {
-		Log("Failed to download URL: %d", Ret);
+	if (Ret)
 		return Ret;
-	}
 
 	Ret = PageChildrenParse(Ctx, Request, Page->AbsoluteUrl);
-	if (Ret) {
-		Log("Failed to parse page childen: %d", Ret);
+	if (Ret)
 		goto page_parse_fail;
-	}
 
 page_parse_fail:
 	InternetCloseHandle(Request);
@@ -1179,24 +1129,18 @@ DWORD WINAPI ThreadPoolWorker(_In_ LPVOID Parameter)
 	PPAGE Page;
 	UINT32 Ret;
 
-	Log("Executing pool worker thread");
-
 	Ret = ArenaInit(DEFAULT_ARENA_ALLOC_SIZE);
-	if (Ret) {
-		Log("Failed to initialise allocator: %u", Ret);
+	if (Ret)
 		return Ret;
-	}
 
 	while ((Page = QueuePop(&Ctx->Queue))) {
 		Log("Page: %s", Page->AbsoluteUrl);
 		Ret = ThreadPoolWorkerHandlePage(Ctx, Page);
-		if (Ret)
-			Log("ThreadPool: Failed to handle page");
+		/* Ignore ret for now */
 
 		QueueCompleteTask(&Ctx->Queue);
 	}
 
-	Log("Terminating worker thread");
 	ArenaDeInit();
 	return ERROR_SUCCESS;
 }
@@ -1260,6 +1204,8 @@ Scrape(_In_ LPSTR Url)
 	SESSION_CONTEXT Ctx = { 0 };
 	UINT32 Ret;
 
+	Ctx.StartTime = GetTickCount64();
+
 	Ret = ArenaInit(DEFAULT_ARENA_ALLOC_SIZE);
 	if (Ret) {
 		Log("Failed to initialise base allocator");
@@ -1307,9 +1253,12 @@ Scrape(_In_ LPSTR Url)
 	/* Workers exit by themselves once Outstanding reaches 0 */
 	ThreadPoolDeInit(&Ctx.Pool);
 
+	Ctx.EndTime = GetTickCount64();
+
 	Log("==================================");
 	Log("Pages Parsed: %d", Ctx.Stats.PagesParsed);
 	Log("Pages Robots Blocked: %d", Ctx.Stats.PagesRobotsBlocked);
+	Log("Time Taken: %.2fs", (Ctx.EndTime - Ctx.StartTime) / 1000.0);
 	Log("==================================");
 
 thread_pool_fail:
