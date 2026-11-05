@@ -288,7 +288,8 @@ HashSetInit(_Out_ PHASH_SET Set)
 	return ERROR_SUCCESS;
 }
 
-#define THREAD_POOL_WORKER_COUNT 16
+/* Also used for max conns */
+#define THREAD_POOL_WORKER_COUNT 64
 
 typedef struct _THREAD_POOL {
 	PHANDLE ThreadHandles;
@@ -471,13 +472,19 @@ STATIC
 UINT32
 SessionInit(_Out_ PSESSION_CONTEXT Ctx)
 {
+	DWORD Protocols = HTTP_PROTOCOL_FLAG_HTTP2;
 	DWORD MaxConns = THREAD_POOL_WORKER_COUNT;
 
+	/* Sent max conns to 64 */
 	InternetSetOptionA(NULL, INTERNET_OPTION_MAX_CONNS_PER_1_0_SERVER,
 					   &MaxConns, sizeof(MaxConns));
 
 	InternetSetOptionA(NULL, INTERNET_OPTION_MAX_CONNS_PER_SERVER, &MaxConns,
 					   sizeof(MaxConns));
+
+	/* Enable HTTP2 */
+	InternetSetOptionA(Ctx->SessionHandle, INTERNET_OPTION_ENABLE_HTTP_PROTOCOL,
+					   &Protocols, sizeof(Protocols));
 
 	Ctx->SessionHandle = InternetOpenA(
 			USER_AGENT_NAME, INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
