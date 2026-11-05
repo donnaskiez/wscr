@@ -14,6 +14,7 @@ search results in chrome.
 
 [1] https://chromewebstore.google.com/detail/hide-gemini-and-google-ai/ggneoaeoplbpehkojnifancipajnhcbp
 
+```
 # Design
 
 ## Connection
@@ -95,7 +96,6 @@ determines which part of the website can be parsed (among
 other things that I am not interested in like sitmaps). A sample
 may look like:
 
-```
 User-agent: *
 Disallow: /*//
 Disallow: //
@@ -105,7 +105,6 @@ Disallow: /infinite
 Disallow: /robots_protocol/robots_excluded_1
 Disallow: /robots_protocol/robots_excluded_2
 Disallow: /robots_protocol/robots_excluded_3
-```
 
 Where `User-agent` specifies the name of the user agent that must
 follow these set of rules. In our case we only care about the `*`
@@ -223,13 +222,11 @@ of having 50 win32 API documentation tabs open lol. I also learnt quite
 alot about HTTP, URLs and arena allocators among other things. The
 scraper ended up being pretty good, and a sample run of [7] is:
 
-```
 [18:18:50.348] [22888] ==================================
 [18:18:50.348] [22888] Pages Parsed: 1194
 [18:18:50.348] [22888] Pages Robots Blocked: 0
 [18:18:50.348] [22888] Time Taken: 18.69s
 [18:18:50.348] [22888] ==================================
-```
 
 # References
 
@@ -240,3 +237,4 @@ scraper ended up being pretty good, and a sample run of [7] is:
 [5] https://andreleite.com/posts/2025/nstl/virtual-memory-arena-allocator/
 [6] https://learn.microsoft.com/en-us/windows/win32/procthread/thread-pool-api
 [7] https://books.toscrape.com/
+```
