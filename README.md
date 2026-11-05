@@ -1,4 +1,5 @@
-﻿# Brief
+﻿```
+# Brief
 
 I saw some tweet about an interview question where you make a
 multithreaded web crawler. Sounded interesting as I have no
@@ -14,7 +15,6 @@ search results in chrome.
 
 [1] https://chromewebstore.google.com/detail/hide-gemini-and-google-ai/ggneoaeoplbpehkojnifancipajnhcbp
 
-```
 # Design
 
 ## Connection
