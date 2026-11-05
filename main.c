@@ -1186,8 +1186,6 @@ ThreadPoolInit(_In_ PSESSION_CONTEXT Ctx, _Out_ PTHREAD_POOL Tp)
 			Tp->ThreadCount = Idx;
 			goto error;
 		}
-
-		SetThreadAffinityMask(Tp->ThreadHandles[Idx], 1ULL << Idx);
 	}
 
 	return ERROR_SUCCESS;
